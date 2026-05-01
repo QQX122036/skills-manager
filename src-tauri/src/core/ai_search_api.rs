@@ -791,6 +791,133 @@ fn verify_skill_exists(
     }
 }
 
+/// Infer a description for a skill based on its name and skill ID.
+fn infer_description_from_name(skill_id: &str, name: &str) -> String {
+    let combined = format!("{} {}", skill_id, name).to_lowercase();
+
+    let tech_descs = [
+        ("playwright", "基于 Playwright 的浏览器自动化测试技能，支持 UI 测试、E2E 测试和页面交互"),
+        ("puppeteer", "基于 Puppeteer 的无头浏览器控制技能，支持网页截图、PDF 生成和自动化操作"),
+        ("selenium", "基于 Selenium 的跨浏览器自动化测试框架，支持多语言多浏览器"),
+        ("cypress", "基于 Cypress 的前端端到端测试技能，支持实时调试和时间旅行"),
+        ("browser", "浏览器相关技能，涉及浏览器自动化、网页抓取或浏览器插件开发"),
+        ("automation", "自动化相关技能，可自动执行重复性任务或工作流程"),
+        ("testing", "测试相关技能，帮助编写、运行和管理自动化测试"),
+        ("test", "测试工具技能，提供测试框架、测试用例或测试报告功能"),
+        ("e2e", "端到端测试技能，模拟真实用户操作进行完整流程测试"),
+        ("visual", "视觉测试相关，涉及截图对比、UI 回归测试或视觉验证"),
+        ("qa", "质量保证相关，帮助进行软件质量检查和自动化验证"),
+        ("web", "Web 开发相关技能，涉及前端构建、Web 服务或网站开发"),
+        ("react", "React 生态技能，涉及 React 组件、Hooks 或状态管理"),
+        ("vue", "Vue.js 生态技能，涉及 Vue 组件、指令或状态管理"),
+        ("next", "Next.js 全栈框架技能，支持 SSR、SSG 和 API 路由"),
+        ("tailwind", "Tailwind CSS 实用类框架技能，支持快速样式开发"),
+        ("api", "API 相关技能，涉及 API 设计、测试或文档生成"),
+        ("cli", "命令行工具技能，提供终端交互和批处理功能"),
+        ("git", "Git 版本控制相关技能，涉及分支管理、代码审查或工作流"),
+        ("docker", "Docker 容器化技能，支持容器编排、镜像构建或部署"),
+        ("kubernetes", "Kubernetes 编排技能，涉及集群管理、服务部署或监控"),
+        ("aws", "AWS 云服务技能，支持 S3、Lambda、EC2 等云资源管理"),
+        ("database", "数据库相关技能，涉及 SQL 查询、迁移或优化"),
+        ("graphql", "GraphQL API 技能，支持查询构建、Schema 设计或代码生成"),
+        ("typescript", "TypeScript 类型系统技能，涉及类型定义、代码检查或编译"),
+        ("python", "Python 编程技能，涉及脚本编写、数据分析或 Web 开发"),
+        ("rust", "Rust 系统编程技能，涉及内存安全、并发或性能优化"),
+        ("go", "Go 语言技能，支持并发编程、微服务或 CLI 工具开发"),
+        ("node", "Node.js 运行时技能，涉及后端服务、API 或中间件开发"),
+        ("agent", "AI Agent 技能，支持智能代理、自主决策或工具调用"),
+        ("claude", "Claude AI 相关技能，涉及提示工程、工具集成或对话管理"),
+        ("cursor", "Cursor 编辑器技能，涉及代码生成、智能补全或项目导航"),
+        ("copilot", "GitHub Copilot 相关技能，支持 AI 辅助编程和代码建议"),
+        ("skill", "技能管理相关，涉及技能的创建、安装、同步或组织"),
+    ];
+
+    let mut found_descs: Vec<&str> = Vec::new();
+    for (keyword, desc) in tech_descs.iter() {
+        if combined.contains(keyword) && !found_descs.contains(desc) {
+            found_descs.push(desc);
+        }
+    }
+
+    if !found_descs.is_empty() {
+        let desc = found_descs[..std::cmp::min(2, found_descs.len())].join("；");
+        return desc;
+    }
+
+    if name.contains('-') {
+        let parts: Vec<&str> = name.split('-').collect();
+        let tech_part = parts.iter().find(|p| {
+            matches!(**p, "playwright" | "puppeteer" | "selenium" | "cypress" | "react" | "vue" | "next" | "tailwind" | "docker" | "rust" | "python")
+        });
+        if let Some(tech) = tech_part {
+            return format!("与 {} 相关的技能，可从名称推断涉及该技术的特定功能模块", tech);
+        }
+    }
+
+    format!("技能库中的候选技能，涉及 {} 相关功能", name)
+}
+
+/// Generate a recommendation reason based on the user query and skill metadata.
+fn infer_recommendation_reason(query: &str, skill_id: &str, name: &str, installs: usize, keywords: &[String]) -> String {
+    let combined = format!("{} {}", skill_id, name).to_lowercase();
+
+    let matched_keywords: Vec<&str> = keywords.iter()
+        .filter(|kw| combined.contains(&kw.to_lowercase()))
+        .map(|s| s.as_str())
+        .collect();
+
+    let install_desc = if installs > 1000 {
+        format!("热门技能（{} 次安装）", installs)
+    } else if installs > 500 {
+        format!("较受欢迎（{} 次安装）", installs)
+    } else if installs > 100 {
+        format!("有一定用户基础（{} 次安装）", installs)
+    } else {
+        format!("{} 次安装", installs)
+    };
+
+    if !matched_keywords.is_empty() {
+        let kw_str = matched_keywords.join("、");
+        return format!("与搜索意图高度匹配，涵盖「{}」等关键词；{}", kw_str, install_desc);
+    }
+
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+    let matched_query_words: Vec<&&str> = query_words.iter()
+        .filter(|w| w.len() > 1 && combined.contains(*w))
+        .collect();
+
+    if !matched_query_words.is_empty() {
+        let w_str = matched_query_words.iter().map(|s| **s).collect::<Vec<_>>().join("、");
+        return format!("名称中包含「{}」关键词，与搜索需求相关；{}", w_str, install_desc);
+    }
+
+    format!("候选技能，{}；建议查看详情以确认是否符合需求", install_desc)
+}
+
+/// Calculate a score for unanalyzed skills based on installs and keyword matching.
+fn calculate_fallback_score(skill_id: &str, name: &str, installs: usize, keywords: &[String]) -> f64 {
+    let combined = format!("{} {}", skill_id, name).to_lowercase();
+
+    let install_score = if installs > 5000 {
+        9.0
+    } else if installs > 1000 {
+        8.0
+    } else if installs > 500 {
+        7.0
+    } else if installs > 100 {
+        6.0
+    } else {
+        5.0
+    };
+
+    let keyword_bonus: f64 = keywords.iter()
+        .filter(|kw| combined.contains(&kw.to_lowercase()))
+        .count() as f64 * 0.5;
+
+    (install_score + keyword_bonus).min(9.5)
+}
+
 /// Deep search: expand query, fetch candidates, download SKILL.md, analyze with AI.
 /// Implements a 4-layer progressive search strategy:
 /// - Layer 1: AI keyword expansion
@@ -959,16 +1086,20 @@ pub fn deep_search(
         channels_used.push("raw_fallback".to_string());
         search_strategy = format!("{}_with_raw_fallback", search_strategy);
 
-        // Create basic analysis entries from the raw search results
+        // Create intelligent analysis entries from the raw search results
         let fallback_analyses: Vec<AiSkillAnalysis> = top_skills.iter().map(|s| {
+            let description = infer_description_from_name(&s.skill_id, &s.name);
+            let reason = infer_recommendation_reason(query, &s.skill_id, &s.name, s.installs.try_into().unwrap_or(0), &keywords);
+            let score = calculate_fallback_score(&s.skill_id, &s.name, s.installs.try_into().unwrap_or(0), &keywords);
+
             AiSkillAnalysis {
                 skill_id: s.skill_id.clone(),
                 skill_name: s.name.clone(),
                 source: s.source.clone(),
-                score: 6.0, // Default moderate score for unanalyzed skills
-                description: format!("来自 {} 的技能，等待详细分析", s.source),
+                score,
+                description,
                 how_to_use: "点击查看详情或安装后使用".to_string(),
-                reason: format!("根据搜索关键词匹配到的候选技能（{} 个安装）", s.installs),
+                reason,
             }
         }).collect();
 
