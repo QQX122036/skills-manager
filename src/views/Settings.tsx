@@ -90,6 +90,11 @@ export function Settings() {
   const [textSize, setTextSize] = useState("default");
   const [skillsmpApiKey, setSkillsmpApiKey] = useState("");
   const [skillsmpSaving, setSkillsmpSaving] = useState(false);
+  // AI API config (OpenAI-compatible: MiniMax, Ollama, etc.)
+  const [aiApiUrl, setAiApiUrl] = useState("");
+  const [aiApiUrlSaving, setAiApiUrlSaving] = useState(false);
+  const [aiApiKey, setAiApiKey] = useState("");
+  const [aiApiKeySaving, setAiApiKeySaving] = useState(false);
   // Agent path editing
   const [editingPathKey, setEditingPathKey] = useState<string | null>(null);
   const [editingPathValue, setEditingPathValue] = useState("");
@@ -221,6 +226,8 @@ export function Settings() {
     });
     api.getSettings("text_size").then((v) => { if (v) { setTextSize(v); applyTextSize(v); } });
     api.getSettings("skillsmp_api_key").then((v) => { if (v) setSkillsmpApiKey(v); });
+    api.getSettings("ai_api_url").then((v) => { if (v) setAiApiUrl(v); });
+    api.getSettings("ai_api_key").then((v) => { if (v) setAiApiKey(v); });
     api.getCentralRepoPath().then((path) => {
       setCentralRepoPath(path);
       setCentralRepoPathInput(path);
@@ -429,6 +436,30 @@ export function Settings() {
       toast.error(t("common.error"));
     } finally {
       setSkillsmpSaving(false);
+    }
+  };
+
+  const handleSaveAiApiUrl = async () => {
+    setAiApiUrlSaving(true);
+    try {
+      await api.setSettings("ai_api_url", aiApiUrl.trim());
+      toast.success(t("common.success"));
+    } catch {
+      toast.error(t("common.error"));
+    } finally {
+      setAiApiUrlSaving(false);
+    }
+  };
+
+  const handleSaveAiApiKey = async () => {
+    setAiApiKeySaving(true);
+    try {
+      await api.setSettings("ai_api_key", aiApiKey.trim());
+      toast.success(t("common.success"));
+    } catch {
+      toast.error(t("common.error"));
+    } finally {
+      setAiApiKeySaving(false);
     }
   };
 
@@ -1249,6 +1280,78 @@ export function Settings() {
                   {t("common.save")}
                 </button>
               </div>
+            </div>
+          </div>
+        </section>
+
+        {/* AI Search Provider (OpenAI-compatible: MiniMax, Ollama, etc.) */}
+        <section>
+          <h2 className="app-section-title mb-3">
+            {t("settings.aiSearchProvider", { defaultValue: "AI Search Provider" })}
+          </h2>
+          <div className="app-panel overflow-hidden divide-y divide-border-subtle">
+            <div className="px-4 py-3">
+              <h3 className="text-[13px] text-secondary font-medium mb-0.5">
+                {t("settings.aiApiUrl", { defaultValue: "API URL" })}
+              </h3>
+              <p className="text-[13px] text-muted mb-2">
+                {t("settings.aiApiUrlDesc", { defaultValue: "OpenAI-compatible API base URL. Leave empty for MiniMax default." })}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  value={aiApiUrl}
+                  onChange={(e) => setAiApiUrl(e.target.value)}
+                  placeholder="https://api.minimax.chat/v1"
+                  className={`${fieldClass} min-w-0 flex-1 font-mono`}
+                />
+                <button
+                  onClick={handleSaveAiApiUrl}
+                  disabled={aiApiUrlSaving}
+                  className={`${actionButtonClass} bg-surface-hover hover:bg-surface-active text-tertiary border-border`}
+                >
+                  {aiApiUrlSaving ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <LinkIcon className="w-3 h-3" />
+                  )}
+                  {t("common.save")}
+                </button>
+              </div>
+            </div>
+            <div className="px-4 py-3">
+              <h3 className="text-[13px] text-secondary font-medium mb-0.5">
+                {t("settings.aiApiKey", { defaultValue: "API Key" })}
+              </h3>
+              <p className="text-[13px] text-muted mb-2">
+                {t("settings.aiApiKeyDesc", { defaultValue: "API key for the AI provider (MiniMax, OpenAI, etc.). Used for AI-powered skill search." })}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="password"
+                  value={aiApiKey}
+                  onChange={(e) => setAiApiKey(e.target.value)}
+                  placeholder="sk-..."
+                  className={`${fieldClass} min-w-0 flex-1 font-mono`}
+                />
+                <button
+                  onClick={handleSaveAiApiKey}
+                  disabled={aiApiKeySaving}
+                  className={`${actionButtonClass} bg-surface-hover hover:bg-surface-active text-tertiary border-border`}
+                >
+                  {aiApiKeySaving ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <Key className="w-3 h-3" />
+                  )}
+                  {t("common.save")}
+                </button>
+              </div>
+              {aiApiKey.trim() && (
+                <p className="text-[12px] text-muted mt-2">
+                  {t("settings.aiApiKeyHint", { defaultValue: "Configured. AI search will use this provider. Leave SkillsMP API key empty to skip SkillsMP." })}
+                </p>
+              )}
             </div>
           </div>
         </section>

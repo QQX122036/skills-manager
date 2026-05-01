@@ -1,10 +1,11 @@
-import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo, useDeferredValue } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from "react";
 import {
   DownloadCloud,
   UploadCloud,
   Github,
   Box,
   Star,
+  Send,
   TrendingUp,
   Clock,
   Plus,
@@ -28,7 +29,7 @@ import { toast } from "sonner";
 import { cn } from "../utils";
 import { useApp } from "../context/AppContext";
 import * as api from "../lib/tauri";
-import type { ScanResult, SkillsShSkill, BatchImportResult, GitPreviewResult } from "../lib/tauri";
+import type { ScanResult, SkillsShSkill, BatchImportResult, GitPreviewResult, AiSkillAnalysis } from "../lib/tauri";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useSearchParams, useNavigate } from "react-router-dom";
@@ -38,7 +39,6 @@ import { getErrorMessage, getErrorKind } from "../lib/error";
 
 const MARKET_PAGE_SIZE = 24;
 const MARKET_SEARCH_STEP = 60;
-const MARKET_SEARCH_DEBOUNCE_MS = 450;
 const MARKET_SEARCH_CACHE_TTL_MS = 120_000;
 const MARKET_SEARCH_CACHE_MAX_ENTRIES = 150;
 
@@ -58,6 +58,12 @@ export function InstallSkills() {
   const [marketLoadingMore, setMarketLoadingMore] = useState(false);
   const [marketError, setMarketError] = useState<string | null>(null);
   const [marketReloadKey, setMarketReloadKey] = useState(0);
+  const [aiThinking, setAiThinking] = useState<string | null>(null);
+  const [deepSearchResults, setDeepSearchResults] = useState<AiSkillAnalysis[]>([]);
+  const [isDeepSearch, setIsDeepSearch] = useState(false);
+  const [searchStrategy, setSearchStrategy] = useState<string>("");
+  const [channelsUsed, setChannelsUsed] = useState<string[]>([]);
+  const [conversationLoading, setConversationLoading] = useState(false);
   const [installing, setInstalling] = useState<string | null>(null);
   const [gitUrl, setGitUrl] = useState("");
   const [gitLoading, setGitLoading] = useState(false);
@@ -74,6 +80,7 @@ export function InstallSkills() {
   const [renameEditing, setRenameEditing] = useState<Record<string, string>>({});
   const [aiSearch, setAiSearch] = useState(false);
   const [skillsmpApiKey, setSkillsmpApiKey] = useState<string | null>(null);
+  const [aiApiKey, setAiApiKey] = useState<string | null>(null);
   const marketListRef = useRef<HTMLDivElement | null>(null);
   const [sourceOverflowOpen, setSourceOverflowOpen] = useState(false);
   const [sourceOverflowSide, setSourceOverflowSide] = useState<"left" | "right">("left");
@@ -90,7 +97,6 @@ export function InstallSkills() {
   const marketSearchCacheRef = useRef<Map<string, { timestamp: number; data: SkillsShSkill[] }>>(new Map());
   const marketSkillsLengthRef = useRef(0);
   const [debouncedMarketQuery, setDebouncedMarketQuery] = useState("");
-  const deferredMarketQuery = useDeferredValue(marketQuery);
   const resetSourceOverflowState = useCallback(() => {
     setSourceOverflowOpen(false);
     setSourceSearch("");
@@ -154,12 +160,12 @@ export function InstallSkills() {
     });
   }, [managedSkills]);
 
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setDebouncedMarketQuery(deferredMarketQuery);
-    }, MARKET_SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-  }, [deferredMarketQuery]);
+  const handleMarketSearch = useCallback(() => {
+    const q = marketQuery.trim();
+    setDebouncedMarketQuery(q);
+    setMarketSearchLimit(MARKET_SEARCH_STEP);
+    setMarketPage(1);
+  }, [marketQuery]);
 
   useEffect(() => {
     marketSkillsLengthRef.current = marketSkills.length;
@@ -180,6 +186,7 @@ export function InstallSkills() {
 
   useEffect(() => {
     api.getSettings("skillsmp_api_key").then((v) => setSkillsmpApiKey(v || null));
+    api.getSettings("ai_api_key").then((v) => setAiApiKey(v || null));
   }, []);
 
   useEffect(() => {
@@ -240,40 +247,138 @@ export function InstallSkills() {
     setMarketError(null);
 
     let stale = false;
-    const request = query
-      ? (aiSearch
-        ? api.searchSkillsmp(query, true, undefined, marketSearchLimit)
-        : api.searchSkillssh(query, marketSearchLimit))
-      : api.fetchLeaderboard(marketTab);
 
-    request
-      .then((result) => {
-        if (stale) return;
-        setMarketSkills(result);
-        if (query.length > 0 && !loadingMore) {
-          const cacheKey = `${query.toLowerCase()}|${aiSearch ? "ai" : "kw"}|${marketSearchLimit}`;
-          marketSearchCacheRef.current.set(cacheKey, { timestamp: Date.now(), data: result });
-          pruneMarketSearchCache();
-        }
-        if (!loadingMore) {
-          setMarketSourceFilter("all");
-        }
-      })
-      .catch((e) => {
-        if (stale) return;
-        console.error(e);
-        const message = e?.toString?.() || t("common.error");
-        setMarketError(message);
-        toast.error(message);
-      })
-      .finally(() => {
-        if (stale) return;
-        setMarketLoading(false);
-        setMarketLoadingMore(false);
-      });
+    if (!query) {
+      setDeepSearchResults([]);
+      setIsDeepSearch(false);
+      const request = api.fetchLeaderboard(marketTab);
+      setAiThinking(null);
+
+      request
+        .then((result) => {
+          if (stale) return;
+          setAiThinking(null);
+          setMarketSkills(result);
+          if (!loadingMore) {
+            setMarketSourceFilter("all");
+          }
+        })
+        .catch((e) => {
+          if (stale) return;
+          console.error(e);
+          const message = getErrorMessage(e, t("common.error"));
+          setAiThinking(null);
+          setMarketError(message);
+          toast.error(message);
+        })
+        .finally(() => {
+          if (stale) return;
+          setMarketLoading(false);
+          setMarketLoadingMore(false);
+        });
+    } else if (aiSearch && aiApiKey) {
+      // Deep search: AI expands keywords, fetches SKILL.md, analyzes and scores
+      setDeepSearchResults([]);
+      setIsDeepSearch(true);
+
+      api.deepSearchWithAi(query)
+        .then((result) => {
+          if (stale) return;
+          setAiThinking(result.thinking || null);
+          setDeepSearchResults(result.analyzed);
+          setSearchStrategy(result.searchStrategy);
+          setChannelsUsed(result.channelsUsed);
+          setMarketSkills([]);
+          setMarketLoading(false);
+          setMarketLoadingMore(false);
+          setMarketError(null);
+        })
+        .catch((e) => {
+          if (stale) return;
+          console.error(e);
+          const message = getErrorMessage(e, t("common.error"));
+          setAiThinking(null);
+          setDeepSearchResults([]);
+          setMarketError(message);
+          toast.error(message);
+        })
+        .finally(() => {
+          if (stale) return;
+          setMarketLoading(false);
+          setMarketLoadingMore(false);
+        });
+    } else if (aiSearch && skillsmpApiKey) {
+      setDeepSearchResults([]);
+      setIsDeepSearch(false);
+      const request = api.searchSkillsmp(query, true, undefined, marketSearchLimit);
+      setAiThinking(null);
+
+      request
+        .then((result) => {
+          if (stale) return;
+          setAiThinking(null);
+          setMarketSkills(result);
+          const skills = result;
+          if (query.length > 0 && !loadingMore) {
+            const cacheKey = `${query.toLowerCase()}|ai|${marketSearchLimit}`;
+            marketSearchCacheRef.current.set(cacheKey, { timestamp: Date.now(), data: skills });
+            pruneMarketSearchCache();
+          }
+          if (!loadingMore) {
+            setMarketSourceFilter("all");
+          }
+        })
+        .catch((e) => {
+          if (stale) return;
+          console.error(e);
+          const message = getErrorMessage(e, t("common.error"));
+          setAiThinking(null);
+          setMarketError(message);
+          toast.error(message);
+        })
+        .finally(() => {
+          if (stale) return;
+          setMarketLoading(false);
+          setMarketLoadingMore(false);
+        });
+    } else {
+      setDeepSearchResults([]);
+      setIsDeepSearch(false);
+      const request = api.searchSkillssh(query, marketSearchLimit);
+      setAiThinking(null);
+
+      request
+        .then((result) => {
+          if (stale) return;
+          setAiThinking(null);
+          setMarketSkills(result);
+          const skills = result;
+          if (query.length > 0 && !loadingMore) {
+            const cacheKey = `${query.toLowerCase()}|kw|${marketSearchLimit}`;
+            marketSearchCacheRef.current.set(cacheKey, { timestamp: Date.now(), data: skills });
+            pruneMarketSearchCache();
+          }
+          if (!loadingMore) {
+            setMarketSourceFilter("all");
+          }
+        })
+        .catch((e) => {
+          if (stale) return;
+          console.error(e);
+          const message = getErrorMessage(e, t("common.error"));
+          setAiThinking(null);
+          setMarketError(message);
+          toast.error(message);
+        })
+        .finally(() => {
+          if (stale) return;
+          setMarketLoading(false);
+          setMarketLoadingMore(false);
+        });
+    }
 
     return () => { stale = true; };
-  }, [activeTab, aiSearch, debouncedMarketQuery, marketReloadKey, marketSearchLimit, marketTab, pruneMarketSearchCache, t]);
+  }, [activeTab, aiApiKey, aiSearch, debouncedMarketQuery, marketReloadKey, marketSearchLimit, marketTab, pruneMarketSearchCache, skillsmpApiKey, t]);
 
   useEffect(() => {
     if (activeTab === "local" && !scanResult && !scanLoading) {
@@ -754,6 +859,12 @@ export function InstallSkills() {
                         setMarketQuery(event.target.value);
                         setMarketSearchLimit(MARKET_SEARCH_STEP);
                       }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          handleMarketSearch();
+                        }
+                      }}
                       placeholder={aiSearch ? t("install.aiSearchPlaceholder", { defaultValue: "AI search — describe what you need..." }) : t("install.searchMarket")}
                       className="app-input w-full bg-background pl-9"
                       autoCapitalize="none"
@@ -762,12 +873,19 @@ export function InstallSkills() {
                     />
                   </div>
                   <button
+                    onClick={handleMarketSearch}
+                    className="shrink-0 h-10 rounded-lg border border-accent-border bg-accent-dark px-3 text-[13px] font-medium text-white transition-colors hover:bg-accent"
+                    title={t("install.search", { defaultValue: "Search" })}
+                  >
+                    <Search className="h-4 w-4" />
+                  </button>
+                  <button
                     onClick={() => {
-                      if (skillsmpApiKey) {
+                      if (aiApiKey || skillsmpApiKey) {
                         setAiSearch((v) => !v);
                       } else {
                         toast.info(
-                          t("install.aiSearchNoKey", { defaultValue: "Set your SkillsMP API key in Settings to enable AI search" }),
+                          t("install.aiSearchNoKey", { defaultValue: "Set your AI API key or SkillsMP API key in Settings to enable AI search" }),
                           {
                             action: {
                               label: t("common.goToSettings", { defaultValue: "Settings" }),
@@ -779,11 +897,11 @@ export function InstallSkills() {
                     }}
                     className={cn(
                       "shrink-0 h-10 rounded-lg border px-3 text-[13px] font-medium transition-colors",
-                      aiSearch && skillsmpApiKey
+                      aiSearch && (aiApiKey || skillsmpApiKey)
                         ? "border-accent-border bg-accent-bg text-accent-light"
                         : "border-border-subtle bg-background text-muted hover:bg-surface-hover hover:text-secondary"
                     )}
-                    title={t("install.aiSearchToggle", { defaultValue: "AI-powered search (SkillsMP)" })}
+                    title={t("install.aiSearchToggle", { defaultValue: "AI-powered search" })}
                   >
                     {t("install.aiSearchButton", { defaultValue: "AI Search" })}
                   </button>
@@ -991,192 +1109,496 @@ export function InstallSkills() {
             <div className="pb-8">
               <div ref={marketListRef} className="scroll-mt-4" />
 
-              {filteredMarketSkills.length === 0 ? (
-                <div className="app-panel flex flex-col items-center justify-center rounded-2xl px-6 py-14 text-center">
-                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-border bg-background text-muted">
-                    <Search className="h-5 w-5" />
-                  </div>
-                  <h3 className="mt-4 text-[14px] font-semibold text-secondary">
-                    {t("install.noResults.title")}
-                  </h3>
-                  <p className="mt-1 max-w-md text-[13px] text-muted">
-                    {t("install.noResults.description")}
-                  </p>
-                </div>
+              {isDeepSearch ? (
+                <>
+                  {aiThinking && (
+                    <details className="app-panel mb-3 rounded-2xl">
+                      <summary className="flex cursor-pointer items-center gap-2 px-4 py-3 text-[13px] font-medium text-muted hover:text-secondary select-none">
+                        <svg className="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z" />
+                          <circle cx="12" cy="15" r="2" />
+                        </svg>
+                        {t("install.aiThinking", { defaultValue: "AI 思考过程" })}
+                      </summary>
+                      <div className="border-t border-border-subtle px-4 py-3">
+                        <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-muted">{aiThinking}</p>
+                      </div>
+                    </details>
+                  )}
+
+                  {deepSearchResults.length > 0 ? (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between px-1">
+                        <div className="flex items-center gap-2">
+                          <Star className="h-4 w-4 text-amber-400" />
+                          <h3 className="text-[14px] font-semibold text-secondary">
+                            AI 推荐结果 ({deepSearchResults.length} 个技能)
+                          </h3>
+                        </div>
+                        <div className="flex items-center gap-1.5 text-[11px] text-muted">
+                          <span className="rounded bg-surface px-1.5 py-0.5">{searchStrategy}</span>
+                          {channelsUsed.map((ch) => (
+                            <span key={ch} className="rounded bg-surface px-1.5 py-0.5">{ch}</span>
+                          ))}
+                        </div>
+                      </div>
+                      
+                      {/* Show already installed skills that match the search */}
+                      {(() => {
+                        const installedMatching = managedSkills.filter((skill) => {
+                          if (skill.source_type !== "skillssh" || !skill.source_ref) return false;
+                          const sourceRef = skill.source_ref.toLowerCase();
+                          const queryLower = debouncedMarketQuery.toLowerCase();
+                          const keywords = queryLower.split(/\s+/).filter(k => k.length > 1);
+                          
+                          // Check if any keyword matches the skill name, source_ref, or description
+                          return keywords.some(kw => 
+                            skill.name.toLowerCase().includes(kw) ||
+                            sourceRef.includes(kw) ||
+                            (skill.description && skill.description.toLowerCase().includes(kw))
+                          );
+                        });
+
+                        return installedMatching.length > 0 ? (
+                          <div className="app-panel rounded-2xl p-4 border-emerald-500/20 bg-emerald-500/5">
+                            <div className="flex items-center gap-2 mb-3">
+                              <Check className="h-4 w-4 text-emerald-400" />
+                              <h4 className="text-[13px] font-semibold text-emerald-400">
+                                已安装的同类技能 ({installedMatching.length} 个)
+                              </h4>
+                            </div>
+                            <div className="grid grid-cols-1 gap-2 lg:grid-cols-2">
+                              {installedMatching.map((skill) => (
+                                <div
+                                  key={skill.id}
+                                  className="flex items-center gap-3 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2"
+                                >
+                                  <div className="flex-1 min-w-0">
+                                    <h5 className="text-[13px] font-medium text-emerald-300 truncate">
+                                      {skill.name}
+                                    </h5>
+                                    {skill.source_ref && (
+                                      <p className="text-[11px] text-emerald-400/70 font-mono truncate">
+                                        {skill.source_ref}
+                                      </p>
+                                    )}
+                                  </div>
+                                  <span className="shrink-0 inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/20 px-2 py-0.5 text-[11px] font-medium text-emerald-400">
+                                    <Check className="h-3 w-3" />
+                                    已安装
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null;
+                      })()}
+                      
+                      <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+                        {deepSearchResults.map((analysis) => {
+                          const scoreColor = analysis.score >= 9
+                            ? "text-emerald-400"
+                            : analysis.score >= 7
+                              ? "text-blue-400"
+                              : analysis.score >= 5
+                                ? "text-amber-400"
+                                : "text-muted";
+                          const scoreBg = analysis.score >= 9
+                            ? "border-emerald-500/20 bg-emerald-500/10"
+                            : analysis.score >= 7
+                              ? "border-blue-500/20 bg-blue-500/10"
+                              : analysis.score >= 5
+                                ? "border-amber-500/20 bg-amber-500/10"
+                                : "border-border-subtle bg-background";
+                          const fullStars = Math.floor(analysis.score / 2);
+                          const hasHalfStar = analysis.score % 2 >= 1;
+                          const emptyStars = 5 - fullStars - (hasHalfStar ? 1 : 0);
+
+                          return (
+                            <div
+                              key={analysis.skillId}
+                              className="app-panel flex flex-col gap-2.5 p-4 rounded-2xl transition-colors hover:border-border"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 mb-1">
+                                    <div className={cn("inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 text-[13px] font-bold", scoreBg, scoreColor)}>
+                                      {[...Array(fullStars)].map((_, i) => (
+                                        <Star key={`full-${i}`} className="h-3.5 w-3.5 fill-current" />
+                                      ))}
+                                      {hasHalfStar && (
+                                        <Star className="h-3.5 w-3.5" />
+                                      )}
+                                      {[...Array(emptyStars)].map((_, i) => (
+                                        <Star key={`empty-${i}`} className="h-3.5 w-3.5 text-muted/30" />
+                                      ))}
+                                      <span className="ml-1">{analysis.score.toFixed(1)}/10</span>
+                                    </div>
+                                  </div>
+                                  <h4 className="text-[14px] font-semibold text-secondary truncate">
+                                    {analysis.skillName || analysis.skillId}
+                                  </h4>
+                                  {analysis.skillName && analysis.skillName !== analysis.skillId && (
+                                    <p className="text-[12px] text-muted font-mono truncate">
+                                      {analysis.source}/{analysis.skillId}
+                                    </p>
+                                  )}
+                                </div>
+                                <div className="flex shrink-0 items-center gap-1.5">
+                                  <button
+                                    onClick={() => openUrl(`https://skills.sh/search?q=${encodeURIComponent(analysis.skillId)}`)}
+                                    className="rounded-[5px] p-1.5 text-muted transition-colors hover:bg-surface-hover hover:text-secondary"
+                                    title="查看原文"
+                                  >
+                                    <ExternalLink className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={async () => {
+                                      const displayName = analysis.skillName || analysis.skillId;
+                                      toast.loading(`正在安装 ${displayName}...`);
+                                      try {
+                                        await api.installFromSkillssh(analysis.source, analysis.skillId);
+                                        await Promise.all([refreshScenarios(), refreshManagedSkills()]);
+                                        toast.success(`${displayName} 安装成功`);
+                                      } catch (e) {
+                                        toast.dismiss();
+                                        toast.error(`安装失败: ${getErrorMessage(e, "未知错误")}`);
+                                      }
+                                    }}
+                                    disabled={installing !== null}
+                                    className="rounded-[5px] border border-accent-border bg-accent-dark p-1.5 text-white transition-colors hover:bg-accent disabled:opacity-50"
+                                    title="安装"
+                                  >
+                                    <Plus className="h-3.5 w-3.5" />
+                                  </button>
+                                </div>
+                              </div>
+
+                              {analysis.description && (
+                                <div className="space-y-1">
+                                  <p className="text-[12px] font-medium text-tertiary">📋 这个技能是什么</p>
+                                  <p className="text-[13px] leading-relaxed text-muted">{analysis.description}</p>
+                                </div>
+                              )}
+
+                              {analysis.howToUse && (
+                                <div className="space-y-1">
+                                  <p className="text-[12px] font-medium text-tertiary">🚀 如何使用</p>
+                                  <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-muted">{analysis.howToUse}</p>
+                                </div>
+                              )}
+
+                              {analysis.reason && (
+                                <div className="space-y-1">
+                                  <p className="text-[12px] font-medium text-tertiary">💡 为什么推荐</p>
+                                  <p className="text-[13px] leading-relaxed text-muted">{analysis.reason}</p>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="app-panel flex flex-col items-center justify-center rounded-2xl px-6 py-14 text-center">
+                      <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-border bg-background text-muted">
+                        <Search className="h-5 w-5" />
+                      </div>
+                      <h3 className="mt-4 text-[14px] font-semibold text-secondary">
+                        AI 未找到推荐技能
+                      </h3>
+                      <p className="mt-1 max-w-md text-[13px] text-muted">
+                        尝试使用不同的搜索词或关闭 AI 搜索进行关键词搜索
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Conversation input for refining search - only show when there are results */}
+                  {deepSearchResults.length > 0 && (
+                    <div className="app-panel rounded-2xl p-4 mt-4">
+                      <div className="flex items-center gap-2 mb-2">
+                        <svg className="h-3.5 w-3.5 text-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                        </svg>
+                        <span className="text-[13px] font-medium text-muted">对结果不满意？继续聊聊找到更合适的技能</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          placeholder="例如：换一批、太专业了、要更简单的、高级一点的..."
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && (e.target as HTMLInputElement).value.trim()) {
+                              const feedback = (e.target as HTMLInputElement).value.trim();
+                              setConversationLoading(true);
+                              api.continueAiSearch(feedback)
+                                .then((result) => {
+                                  setAiThinking(result.thinking || null);
+                                  setDeepSearchResults(result.analyzed);
+                                  setSearchStrategy(result.searchStrategy);
+                                  setChannelsUsed(result.channelsUsed);
+                                  (e.target as HTMLInputElement).value = "";
+                                  marketListRef.current?.scrollIntoView({ behavior: "smooth" });
+                                })
+                                .catch((err) => {
+                                  toast.error(getErrorMessage(err, "对话搜索失败"));
+                                })
+                                .finally(() => {
+                                  setConversationLoading(false);
+                                });
+                            }
+                          }}
+                          className="app-input flex-1 bg-background"
+                        />
+                        <button
+                          onClick={() => {
+                            const input = document.querySelector<HTMLInputElement>('input[placeholder*="换一批"]');
+                            if (input?.value.trim()) {
+                              input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+                            }
+                          }}
+                          disabled={conversationLoading}
+                          className="shrink-0 rounded-lg border border-accent-border bg-accent-dark px-3 text-[13px] font-medium text-white transition-colors hover:bg-accent disabled:opacity-50"
+                        >
+                          {conversationLoading ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Send className="h-4 w-4" />
+                          )}
+                        </button>
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {["换一批", "太专业了", "要更简单的", "高级一点的"].map((fb) => (
+                          <button
+                            key={fb}
+                            onClick={async () => {
+                              setConversationLoading(true);
+                              try {
+                                const result = await api.continueAiSearch(fb);
+                                setAiThinking(result.thinking || null);
+                                setDeepSearchResults(result.analyzed);
+                                setSearchStrategy(result.searchStrategy);
+                                setChannelsUsed(result.channelsUsed);
+                                marketListRef.current?.scrollIntoView({ behavior: "smooth" });
+                              } catch (err) {
+                                toast.error(getErrorMessage(err, "对话搜索失败"));
+                              } finally {
+                                setConversationLoading(false);
+                              }
+                            }}
+                            disabled={conversationLoading}
+                            className="rounded-[5px] border border-border-subtle bg-surface px-2 py-0.5 text-[12px] text-muted transition-colors hover:bg-surface-hover disabled:opacity-50"
+                          >
+                            {fb}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
               ) : (
                 <>
-                  <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-3">
-                    {paginatedMarketSkills.map((skill) => {
-                      const displayName = skill.name || skill.skill_id;
-                      const showSkillId = skill.skill_id.trim() !== displayName.trim();
-                      const owner = skill.source.split("/")[0];
-                      const avatarUrl = `https://github.com/${owner}.png?size=32`;
-                      const sourceRef = `${skill.source}/${skill.skill_id}`;
-                      const isInstalled = installedSourceRefs.has(sourceRef);
+                  {filteredMarketSkills.length === 0 ? (
+                    <div className="app-panel flex flex-col items-center justify-center rounded-2xl px-6 py-14 text-center">
+                      <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-border bg-background text-muted">
+                        <Search className="h-5 w-5" />
+                      </div>
+                      <h3 className="mt-4 text-[14px] font-semibold text-secondary">
+                        {t("install.noResults.title")}
+                      </h3>
+                      <p className="mt-1 max-w-md text-[13px] text-muted">
+                        {t("install.noResults.description")}
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      {aiThinking && (
+                        <details className="app-panel mb-3 rounded-2xl">
+                          <summary className="flex cursor-pointer items-center gap-2 px-4 py-3 text-[13px] font-medium text-muted hover:text-secondary select-none">
+                            <svg className="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z" />
+                              <circle cx="12" cy="15" r="2" />
+                            </svg>
+                            {t("install.aiThinking", { defaultValue: "AI 思考过程" })}
+                          </summary>
+                          <div className="border-t border-border-subtle px-4 py-3">
+                            <p className="whitespace-pre-wrap text-[13px] leading-relaxed text-muted">{aiThinking}</p>
+                          </div>
+                        </details>
+                      )}
+                      <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-3">
+                        {paginatedMarketSkills.map((skill) => {
+                          const displayName = skill.name || skill.skill_id;
+                          const showSkillId = skill.skill_id.trim() !== displayName.trim();
+                          const owner = skill.source.split("/")[0];
+                          const avatarUrl = `https://github.com/${owner}.png?size=32`;
+                          const sourceRef = `${skill.source}/${skill.skill_id}`;
+                          const isInstalled = installedSourceRefs.has(sourceRef);
 
-                      return (
-                      <div
-                        key={skill.id}
-                        className="app-panel flex flex-col gap-2 p-3 transition-colors hover:border-border"
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="flex min-w-0 flex-1 items-center gap-2">
-                            <img
-                              src={avatarUrl}
-                              alt={owner}
-                              className="h-6 w-6 shrink-0 rounded-full border border-border-subtle"
-                              loading="lazy"
-                            />
-                            <div className="min-w-0">
-                              <h3 className="truncate text-[13px] font-semibold text-secondary">
-                                {displayName}
-                              </h3>
-                              {showSkillId ? (
-                                <p className="truncate text-[13px] leading-4 text-muted">{skill.skill_id}</p>
+                          return (
+                          <div
+                            key={skill.id}
+                            className="app-panel flex flex-col gap-2 p-3 transition-colors hover:border-border"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex min-w-0 flex-1 items-center gap-2">
+                                <img
+                                  src={avatarUrl}
+                                  alt={owner}
+                                  className="h-6 w-6 shrink-0 rounded-full border border-border-subtle"
+                                  loading="lazy"
+                                />
+                                <div className="min-w-0">
+                                  <h3 className="truncate text-[13px] font-semibold text-secondary">
+                                    {displayName}
+                                  </h3>
+                                  {showSkillId ? (
+                                    <p className="truncate text-[13px] leading-4 text-muted">{skill.skill_id}</p>
+                                  ) : null}
+                                </div>
+                              </div>
+
+                              <div className="flex shrink-0 items-center gap-1">
+                                <button
+                                  onClick={() => openUrl(`https://skills.sh/${skill.source}/${skill.skill_id}`)}
+                                  className="rounded-[5px] p-1 text-muted transition-colors hover:bg-surface-hover hover:text-secondary"
+                                  title={t("install.viewOnWeb")}
+                                >
+                                  <ExternalLink className="h-3.5 w-3.5" />
+                                </button>
+                                {isInstalled ? (
+                                  <span
+                                    className="rounded-[5px] border border-emerald-500/20 bg-emerald-500/10 p-1 text-emerald-400"
+                                    title={t("install.installed")}
+                                  >
+                                    <Check className="h-3.5 w-3.5" />
+                                  </span>
+                                ) : installing === skill.id ? (
+                                  <button
+                                    onClick={() => handleCancelInstall(`${skill.source}/${skill.skill_id}`)}
+                                    className="inline-flex items-center gap-1 rounded-[5px] border border-red-500/30 bg-red-500/10 px-1.5 py-1 text-red-400 transition-colors hover:bg-red-500/20"
+                                    title={t("install.cancel")}
+                                    aria-label={t("install.cancel")}
+                                  >
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                    <span className="text-[11px] leading-none font-medium">
+                                      {t("install.cancel")}
+                                    </span>
+                                  </button>
+                                ) : (
+                                  <button
+                                    onClick={() => handleInstallSkillssh(skill)}
+                                    disabled={installing !== null}
+                                    className="rounded-[5px] border border-accent-border bg-accent-dark p-1 text-white transition-colors hover:bg-accent disabled:opacity-50"
+                                    title={t("install.oneClickInstall")}
+                                  >
+                                    <Plus className="h-3.5 w-3.5" />
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => setMarketSourceFilter(skill.source)}
+                                disabled={marketSourceFilter === skill.source}
+                                title={t("install.onlyThisContributor")}
+                                className={cn(
+                                  "rounded-[5px] bg-accent-bg px-1.5 py-0.5 text-[13px] leading-4 font-medium text-accent-light transition-colors",
+                                  marketSourceFilter === skill.source
+                                    ? "cursor-default opacity-90"
+                                    : "hover:bg-accent-bg/80"
+                                )}
+                              >
+                                @{skill.source}
+                              </button>
+                              {marketTab === "alltime" && skill.installs > 0 && (
+                                <span className="inline-flex items-center gap-1 rounded-[5px] border border-border-subtle bg-background px-1.5 py-0.5 text-[13px] leading-4 text-muted">
+                                  <DownloadCloud className="h-3 w-3" />
+                                  {skill.installs >= 1_000_000
+                                    ? `${(skill.installs / 1_000_000).toFixed(1)}M`
+                                    : skill.installs >= 1_000
+                                      ? `${(skill.installs / 1_000).toFixed(1)}K`
+                                      : skill.installs}
+                                </span>
+                              )}
+                              {isInstalled ? (
+                                <span className="inline-flex items-center gap-1 rounded-[5px] border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 text-[13px] leading-4 font-medium text-emerald-400">
+                                  <Check className="h-3 w-3" />
+                                  {t("install.installed")}
+                                </span>
                               ) : null}
                             </div>
                           </div>
+                          );
+                        })}
+                      </div>
 
-                          <div className="flex shrink-0 items-center gap-1">
-                            <button
-                              onClick={() => openUrl(`https://skills.sh/${skill.source}/${skill.skill_id}`)}
-                              className="rounded-[5px] p-1 text-muted transition-colors hover:bg-surface-hover hover:text-secondary"
-                              title={t("install.viewOnWeb")}
-                            >
-                              <ExternalLink className="h-3.5 w-3.5" />
-                            </button>
-                            {isInstalled ? (
-                              <span
-                                className="rounded-[5px] border border-emerald-500/20 bg-emerald-500/10 p-1 text-emerald-400"
-                                title={t("install.installed")}
-                              >
-                                <Check className="h-3.5 w-3.5" />
-                              </span>
-                            ) : installing === skill.id ? (
-                              <button
-                                onClick={() => handleCancelInstall(`${skill.source}/${skill.skill_id}`)}
-                                className="inline-flex items-center gap-1 rounded-[5px] border border-red-500/30 bg-red-500/10 px-1.5 py-1 text-red-400 transition-colors hover:bg-red-500/20"
-                                title={t("install.cancel")}
-                                aria-label={t("install.cancel")}
-                              >
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                <span className="text-[11px] leading-none font-medium">
-                                  {t("install.cancel")}
-                                </span>
-                              </button>
-                            ) : (
-                              <button
-                                onClick={() => handleInstallSkillssh(skill)}
-                                disabled={installing !== null}
-                                className="rounded-[5px] border border-accent-border bg-accent-dark p-1 text-white transition-colors hover:bg-accent disabled:opacity-50"
-                                title={t("install.oneClickInstall")}
-                              >
-                                <Plus className="h-3.5 w-3.5" />
-                              </button>
-                            )}
-                          </div>
+                      {totalMarketPages > 1 ? (
+                        <div className="mt-5 flex flex-wrap items-center justify-center gap-1.5">
+                          <button
+                            onClick={() => changeMarketPage(Math.max(1, currentMarketPage - 1))}
+                            disabled={currentMarketPage === 1}
+                            className="inline-flex items-center gap-1 rounded-[6px] border border-border-subtle bg-surface px-3 py-1.5 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
+                          >
+                            <ChevronLeft className="h-3.5 w-3.5" />
+                            {t("install.pagination.previous")}
+                          </button>
+
+                          {visibleMarketPages.map((page, index) => {
+                            const previousPage = visibleMarketPages[index - 1];
+                            const showGap = previousPage && page - previousPage > 1;
+
+                            return (
+                              <div key={page} className="flex items-center gap-1.5">
+                                {showGap ? <span className="px-1 text-[13px] text-faint">...</span> : null}
+                                <button
+                                  onClick={() => changeMarketPage(page)}
+                                  className={cn(
+                                    "min-w-8 rounded-[6px] border px-2.5 py-1.5 text-[13px] font-semibold transition-colors",
+                                    page === currentMarketPage
+                                      ? "border-accent-border bg-accent-dark text-white"
+                                      : "border-border-subtle bg-surface text-secondary hover:bg-surface-hover"
+                                  )}
+                                >
+                                  {page}
+                                </button>
+                              </div>
+                            );
+                          })}
+
+                          <button
+                            onClick={() => changeMarketPage(Math.min(totalMarketPages, currentMarketPage + 1))}
+                            disabled={currentMarketPage === totalMarketPages}
+                            className="inline-flex items-center gap-1 rounded-[6px] border border-border-subtle bg-surface px-3 py-1.5 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
+                          >
+                            {t("install.pagination.next")}
+                            <ChevronRight className="h-3.5 w-3.5" />
+                          </button>
                         </div>
+                      ) : null}
 
-                        <div className="flex flex-wrap items-center gap-1">
+                      {hasMarketQuery ? (
+                        <div className="mt-4 flex justify-center">
                           <button
                             type="button"
-                            onClick={() => setMarketSourceFilter(skill.source)}
-                            disabled={marketSourceFilter === skill.source}
-                            title={t("install.onlyThisContributor")}
-                            className={cn(
-                              "rounded-[5px] bg-accent-bg px-1.5 py-0.5 text-[13px] leading-4 font-medium text-accent-light transition-colors",
-                              marketSourceFilter === skill.source
-                                ? "cursor-default opacity-90"
-                                : "hover:bg-accent-bg/80"
-                            )}
+                            onClick={() => setMarketSearchLimit((value) => value + MARKET_SEARCH_STEP)}
+                            disabled={!canLoadMoreSearch || marketLoading}
+                            className="inline-flex items-center gap-2 rounded-[6px] border border-border-subtle bg-surface px-3.5 py-2 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
                           >
-                            @{skill.source}
+                            {marketLoading ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Search className="h-3.5 w-3.5" />
+                            )}
+                            {isLoadingMoreSearch
+                              ? t("install.loadingMore")
+                              : t("install.loadMoreSearch")}
                           </button>
-                          {marketTab === "alltime" && skill.installs > 0 && (
-                            <span className="inline-flex items-center gap-1 rounded-[5px] border border-border-subtle bg-background px-1.5 py-0.5 text-[13px] leading-4 text-muted">
-                              <DownloadCloud className="h-3 w-3" />
-                              {skill.installs >= 1_000_000
-                                ? `${(skill.installs / 1_000_000).toFixed(1)}M`
-                                : skill.installs >= 1_000
-                                  ? `${(skill.installs / 1_000).toFixed(1)}K`
-                                  : skill.installs}
-                            </span>
-                          )}
-                          {isInstalled ? (
-                            <span className="inline-flex items-center gap-1 rounded-[5px] border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 text-[13px] leading-4 font-medium text-emerald-400">
-                              <Check className="h-3 w-3" />
-                              {t("install.installed")}
-                            </span>
-                          ) : null}
                         </div>
-                      </div>
-                      );
-                    })}
-                  </div>
-
-                  {totalMarketPages > 1 ? (
-                    <div className="mt-5 flex flex-wrap items-center justify-center gap-1.5">
-                      <button
-                        onClick={() => changeMarketPage(Math.max(1, currentMarketPage - 1))}
-                        disabled={currentMarketPage === 1}
-                        className="inline-flex items-center gap-1 rounded-[6px] border border-border-subtle bg-surface px-3 py-1.5 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-                      >
-                        <ChevronLeft className="h-3.5 w-3.5" />
-                        {t("install.pagination.previous")}
-                      </button>
-
-                      {visibleMarketPages.map((page, index) => {
-                        const previousPage = visibleMarketPages[index - 1];
-                        const showGap = previousPage && page - previousPage > 1;
-
-                        return (
-                          <div key={page} className="flex items-center gap-1.5">
-                            {showGap ? <span className="px-1 text-[13px] text-faint">...</span> : null}
-                            <button
-                              onClick={() => changeMarketPage(page)}
-                              className={cn(
-                                "min-w-8 rounded-[6px] border px-2.5 py-1.5 text-[13px] font-semibold transition-colors",
-                                page === currentMarketPage
-                                  ? "border-accent-border bg-accent-dark text-white"
-                                  : "border-border-subtle bg-surface text-secondary hover:bg-surface-hover"
-                              )}
-                            >
-                              {page}
-                            </button>
-                          </div>
-                        );
-                      })}
-
-                      <button
-                        onClick={() => changeMarketPage(Math.min(totalMarketPages, currentMarketPage + 1))}
-                        disabled={currentMarketPage === totalMarketPages}
-                        className="inline-flex items-center gap-1 rounded-[6px] border border-border-subtle bg-surface px-3 py-1.5 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
-                      >
-                        {t("install.pagination.next")}
-                        <ChevronRight className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  ) : null}
-
-                  {hasMarketQuery ? (
-                    <div className="mt-4 flex justify-center">
-                      <button
-                        type="button"
-                        onClick={() => setMarketSearchLimit((value) => value + MARKET_SEARCH_STEP)}
-                        disabled={!canLoadMoreSearch || marketLoading}
-                        className="inline-flex items-center gap-2 rounded-[6px] border border-border-subtle bg-surface px-3.5 py-2 text-[13px] font-medium text-secondary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {marketLoading ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <Search className="h-3.5 w-3.5" />
-                        )}
-                        {isLoadingMoreSearch
-                          ? t("install.loadingMore")
-                          : t("install.loadMoreSearch")}
-                      </button>
-                    </div>
-                  ) : null}
+                      ) : null}
+                    </>
+                  )}
                 </>
               )}
             </div>

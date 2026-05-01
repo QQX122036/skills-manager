@@ -436,6 +436,10 @@ pub fn run() {
             commands::browse::fetch_leaderboard,
             commands::browse::search_skillssh,
             commands::browse::search_skillsmp,
+            // AI Search
+            commands::ai_search::search_with_ai_api,
+            commands::ai_search::deep_search_with_ai,
+            commands::ai_search::continue_ai_search,
             // Settings
             commands::settings::get_settings,
             commands::settings::set_settings,

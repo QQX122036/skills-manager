@@ -197,6 +197,19 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn can_create_symlink() -> bool {
+    use tempfile::tempdir;
+    let tmp = match tempdir() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let src = tmp.path().join("src");
+    let dst = tmp.path().join("dst");
+    let _ = std::fs::create_dir_all(&src);
+    std::os::windows::fs::symlink_dir(&src, &dst).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +313,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn sync_skill_symlink_creates_symlink_on_windows() {
+        // Skip on Windows if symlink privileges are not available
+        if !can_create_symlink() {
+            return;
+        }
+
         let tmp = tempdir().unwrap();
         let src = tmp.path().join("source");
         let tgt = tmp.path().join("target");
@@ -467,6 +485,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn remove_target_removes_directory_symlink() {
+        // Skip on Windows if symlink privileges are not available
+        if !can_create_symlink() {
+            return;
+        }
+
         let tmp = tempdir().unwrap();
         let real = tmp.path().join("real");
         fs::create_dir_all(&real).unwrap();

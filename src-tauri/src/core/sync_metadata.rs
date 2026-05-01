@@ -539,6 +539,14 @@ fn ensure_unique_path_keys(skills: &[SkillMetaFile]) -> Result<()> {
 fn relative_skill_path(central_path: &str) -> Result<String> {
     let root = central_repo::skills_dir();
     let path = PathBuf::from(central_path);
+    
+    #[cfg(windows)]
+    let (root, path) = {
+        let root = root.canonicalize().unwrap_or(root);
+        let path = path.canonicalize().unwrap_or(path);
+        (root, path)
+    };
+    
     let relative = path
         .strip_prefix(&root)
         .with_context(|| format!("skill path is outside skills root: {}", path.display()))?;

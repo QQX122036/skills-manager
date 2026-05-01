@@ -1,3 +1,4 @@
+pub mod ai_search_api;
 pub mod central_repo;
 pub mod content_hash;
 pub mod crypto;
@@ -17,4 +18,7 @@ pub mod skillsmp_api;
 pub mod skillssh_api;
 pub mod sync_engine;
 pub mod sync_metadata;
+pub mod test_ai_search;
 pub mod tool_adapters;
+
+pub use ai_search_api::{fetch_skill_content, AiSkillAnalysis, DeepSearchResult, SkillContent};

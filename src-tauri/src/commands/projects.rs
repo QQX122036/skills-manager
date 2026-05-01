@@ -1122,6 +1122,18 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[cfg(windows)]
+    fn can_create_symlink() -> bool {
+        let tmp = match tempdir() {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let _ = fs::create_dir_all(&src);
+        std::os::windows::fs::symlink_dir(&src, &dst).is_ok()
+    }
+
     fn sample_managed_skill(
         central_path: String,
         content_hash: Option<String>,
@@ -1278,6 +1290,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn remove_workspace_skill_target_removes_directory_symlink_without_touching_target() {
+        // Skip on Windows if symlink privileges are not available
+        if !can_create_symlink() {
+            return;
+        }
+
         let tmp = tempdir().unwrap();
         let real = tmp.path().join("real-skill");
         let link = tmp.path().join("linked-skill");

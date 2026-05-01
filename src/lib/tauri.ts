@@ -365,6 +365,39 @@ export const searchSkillsmp = (
     limit: limit ?? null,
   });
 
+export interface AiSearchResult {
+  thinking: string;
+  skills: SkillsShSkill[];
+}
+
+export interface AiSkillAnalysis {
+  skillId: string;
+  skillName: string;
+  source: string;
+  score: number;
+  description: string;
+  howToUse: string;
+  reason: string;
+}
+
+export interface DeepSearchResult {
+  thinking: string;
+  totalFound: number;
+  analyzed: AiSkillAnalysis[];
+  searchStrategy: string;
+  channelsUsed: string[];
+  verificationPassed: number;
+}
+
+export const searchWithAiApi = (query: string) =>
+  invoke<AiSearchResult>("search_with_ai_api", { query });
+
+export const deepSearchWithAi = (query: string) =>
+  invoke<DeepSearchResult>("deep_search_with_ai", { query });
+
+export const continueAiSearch = (feedback: string) =>
+  invoke<DeepSearchResult>("continue_ai_search", { feedback });
+
 // ── Settings ──
 
 export const getSettings = (key: string) =>
