@@ -395,8 +395,8 @@ export const searchWithAiApi = (query: string) =>
 export const deepSearchWithAi = (query: string) =>
   invoke<DeepSearchResult>("deep_search_with_ai", { query });
 
-export const continueAiSearch = (feedback: string) =>
-  invoke<DeepSearchResult>("continue_ai_search", { feedback });
+export const continueAiSearch = (feedback: string, previousSkillIds?: string[], conversationHistory?: string) =>
+  invoke<DeepSearchResult>("continue_ai_search", { feedback, previousSkillIds, conversationHistory });
 
 // ── Settings ──
 

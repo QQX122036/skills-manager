@@ -64,6 +64,7 @@ export function InstallSkills() {
   const [searchStrategy, setSearchStrategy] = useState<string>("");
   const [channelsUsed, setChannelsUsed] = useState<string[]>([]);
   const [conversationLoading, setConversationLoading] = useState(false);
+  const [conversationHistory, setConversationHistory] = useState<Array<{role: string; content: string}>>([]);
   const [installing, setInstalling] = useState<string | null>(null);
   const [gitUrl, setGitUrl] = useState("");
   const [gitLoading, setGitLoading] = useState(false);
@@ -292,6 +293,17 @@ export function InstallSkills() {
           setMarketLoading(false);
           setMarketLoadingMore(false);
           setMarketError(null);
+          // Initialize conversation history
+          const history: Array<{role: string; content: string}> = [
+            { role: 'user', content: query },
+            { role: 'assistant', content: `推荐了 ${result.analyzed.length} 个技能: ${result.analyzed.map(r => r.skillId).join(', ')}` }
+          ];
+          setConversationHistory(history);
+          // Persist to backend for cross-session continuity
+          try {
+            api.setSettings('last_ai_search_query', query);
+            api.setSettings('last_ai_search_history', JSON.stringify(history));
+          } catch {}
         })
         .catch((e) => {
           if (stale) return;
@@ -1150,12 +1162,9 @@ export function InstallSkills() {
                           // source_ref format: "@owner/repo" or "owner/repo"
                           const cleanRef = skill.source_ref.replace(/^@/, "");
                           
-                          // Check if the installed skill is already in the AI results (same source + skill_id)
+                          // Check if the installed skill is already in the AI results (same source + same skill_id)
                           const isAlreadyRecommended = deepSearchResults.some(
-                            (r) => {
-                              const aiFullRef = `${r.source}/${r.skillId}`;
-                              return aiFullRef === cleanRef || cleanRef.endsWith(`/${r.skillId}`);
-                            }
+                            (r) => r.source === cleanRef && r.skillId === skill.id
                           );
                           
                           if (isAlreadyRecommended) return true;
@@ -1165,7 +1174,7 @@ export function InstallSkills() {
                           const keywords = queryLower.split(/\s+/).filter(k => k.length > 1);
                           return keywords.some(kw => 
                             skill.name.toLowerCase().includes(kw) ||
-                            skill.source_ref.toLowerCase().includes(kw) ||
+                            (skill.source_ref && skill.source_ref.toLowerCase().includes(kw)) ||
                             (skill.description && skill.description.toLowerCase().includes(kw))
                           );
                         });
@@ -1341,12 +1350,19 @@ export function InstallSkills() {
                             if (e.key === "Enter" && (e.target as HTMLInputElement).value.trim()) {
                               const feedback = (e.target as HTMLInputElement).value.trim();
                               setConversationLoading(true);
-                              api.continueAiSearch(feedback)
+                              const previousIds = deepSearchResults.map(r => `${r.source}/${r.skillId}`);
+                              const historyStr = JSON.stringify(conversationHistory);
+                              api.continueAiSearch(feedback, previousIds, historyStr)
                                 .then((result) => {
                                   setAiThinking(result.thinking || null);
                                   setDeepSearchResults(result.analyzed);
                                   setSearchStrategy(result.searchStrategy);
                                   setChannelsUsed(result.channelsUsed);
+                                  // Append to conversation history
+                                  setConversationHistory(prev => [...prev,
+                                    { role: 'user', content: feedback },
+                                    { role: 'assistant', content: `推荐了 ${result.analyzed.length} 个技能: ${result.analyzed.map(r => r.skillId).join(', ')}` }
+                                  ]);
                                   (e.target as HTMLInputElement).value = "";
                                   marketListRef.current?.scrollIntoView({ behavior: "smooth" });
                                 })
@@ -1384,11 +1400,18 @@ export function InstallSkills() {
                             onClick={async () => {
                               setConversationLoading(true);
                               try {
-                                const result = await api.continueAiSearch(fb);
+                                const previousIds = deepSearchResults.map(r => `${r.source}/${r.skillId}`);
+                                const historyStr = JSON.stringify(conversationHistory);
+                                const result = await api.continueAiSearch(fb, previousIds, historyStr);
                                 setAiThinking(result.thinking || null);
                                 setDeepSearchResults(result.analyzed);
                                 setSearchStrategy(result.searchStrategy);
                                 setChannelsUsed(result.channelsUsed);
+                                // Append to conversation history
+                                setConversationHistory(prev => [...prev,
+                                  { role: 'user', content: fb },
+                                  { role: 'assistant', content: `推荐了 ${result.analyzed.length} 个技能: ${result.analyzed.map(r => r.skillId).join(', ')}` }
+                                ]);
                                 marketListRef.current?.scrollIntoView({ behavior: "smooth" });
                               } catch (err) {
                                 toast.error(getErrorMessage(err, "对话搜索失败"));

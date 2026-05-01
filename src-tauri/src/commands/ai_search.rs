@@ -90,11 +90,15 @@ pub async fn deep_search_with_ai(
     let proxy_url = store.proxy_url();
 
     let proxy = proxy_url;
+    let query_clone = query.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         ai_search_api::deep_search(&ai_api_url, &ai_api_key, &query, proxy.as_deref())
             .map_err(AppError::network)
     })
     .await??;
+
+    // Save query for conversation search continuity
+    let _ = store.set_setting("last_search_query", &query_clone);
 
     let analyzed = result.analyzed.into_iter().map(|a| AiSkillAnalysisResult {
         skillId: a.skill_id,
@@ -120,6 +124,8 @@ pub async fn deep_search_with_ai(
 #[tauri::command]
 pub async fn continue_ai_search(
     feedback: String,
+    previous_skill_ids: Option<Vec<String>>,
+    conversation_history: Option<String>,
     store: State<'_, Arc<SkillStore>>,
 ) -> Result<DeepSearchResult, AppError> {
     let ai_api_url = store
@@ -140,10 +146,12 @@ pub async fn continue_ai_search(
         .map_err(AppError::db)?
         .unwrap_or_else(|| "skills".to_string());
 
+    let prev_ids = previous_skill_ids.unwrap_or_default();
     let feedback_ref = feedback.clone();
+    let history_ref = conversation_history.clone();
     let proxy = proxy_url;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        ai_search_api::conversation_search(&ai_api_url, &ai_api_key, &last_query, &feedback_ref, proxy.as_deref())
+        ai_search_api::conversation_search(&ai_api_url, &ai_api_key, &last_query, &feedback_ref, &prev_ids, history_ref.as_deref(), proxy.as_deref())
             .map_err(AppError::network)
     })
     .await??;

@@ -791,6 +791,218 @@ fn verify_skill_exists(
     }
 }
 
+
+/// Fetch README.md from GitHub and extract a brief summary.
+/// Tries main branch first, then master branch. Returns None if both fail.
+fn fetch_readme_description(
+    source: &str,
+    proxy_url: Option<&str>,
+) -> Option<String> {
+    let client = build_http_client(proxy_url, 5);
+    let clean_source = source.trim_start_matches('@');
+    let parts: Vec<&str> = clean_source.split('/').collect();
+    if parts.len() < 2 { return None; }
+
+    let owner = parts[0];
+    let repo = parts[1..].join("/");
+
+    for branch in &["main", "master"] {
+        let url = format!(
+            "https://raw.githubusercontent.com/{}/{}/{}/README.md",
+            owner, repo, branch
+        );
+        if let Ok(resp) = client.get(&url).timeout(std::time::Duration::from_secs(5)).send() {
+            if resp.status().is_success() {
+                if let Ok(raw) = resp.text() {
+                    let summary = extract_readme_summary(&raw);
+                    if !summary.is_empty() {
+                        log::info!("README fetched for {}: {} chars", source, summary.len());
+                        return Some(summary);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract a meaningful description from README content.
+/// Strategy: skip badges/code blocks, take the first meaningful paragraph after the first heading.
+fn extract_readme_summary(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut summary_lines: Vec<&str> = Vec::new();
+    let mut in_code_block = false;
+    let mut past_first_heading = false;
+
+    for line in lines.iter().take(80) {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") { in_code_block = !in_code_block; continue; }
+        if in_code_block { continue; }
+        if trimmed.starts_with("[!") || trimmed.contains("shields.io") { continue; }
+        if trimmed.starts_with("![") { continue; }
+
+        if trimmed.starts_with('#') {
+            past_first_heading = true;
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !summary_lines.is_empty() { break; }
+            continue;
+        }
+
+        if past_first_heading || !summary_lines.is_empty() {
+            let cleaned = trimmed.replace('*', "").replace('_', "").replace('#', "").trim().to_string();
+            if !cleaned.is_empty() {
+                summary_lines.push(cleaned.leak());
+            }
+            if summary_lines.len() >= 3 { break; }
+        }
+    }
+
+    if summary_lines.is_empty() { return String::new(); }
+
+    let desc = summary_lines.join(" ");
+    if desc.len() > 150 { format!("{}...", &desc[..150]) } else { desc }
+}
+
+/// Fetch SKILL.md from the skill subdirectory and extract description.
+/// Tries main branch first, then master branch. Returns None if both fail.
+fn fetch_skill_md_fallback_description(
+    source: &str,
+    skill_id: &str,
+    _proxy_url: Option<&str>,
+) -> Option<String> {
+    let clean_source = source.trim_start_matches('@');
+    let parts: Vec<&str> = clean_source.split('/').collect();
+    if parts.len() < 2 { return None; }
+
+    let owner = parts[0];
+    let repo = parts[1..].join("/");
+
+    for branch in &["main", "master"] {
+        let url = format!(
+            "https://raw.githubusercontent.com/{}/{}/{}/{}/SKILL.md",
+            owner, repo, branch, skill_id
+        );
+        if let Ok(resp) = reqwest::blocking::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+        {
+            if resp.status().is_success() {
+                if let Ok(raw) = resp.text() {
+                    let desc = extract_skill_md_description(&raw);
+                    if !desc.is_empty() {
+                        log::info!("SKILL.md fallback fetched for {}/{}: {} chars", source, skill_id, desc.len());
+                        return Some(desc);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract description from SKILL.md content.
+/// Parses YAML frontmatter first, then markdown sections.
+fn extract_skill_md_description(content: &str) -> String {
+    // Try YAML frontmatter first
+    if content.starts_with("---") {
+        if let Some(end) = content[3..].find("---") {
+            let yaml_block = &content[3..end + 3];
+            // Extract name and description from YAML
+            let mut name = String::new();
+            let mut desc = String::new();
+            for line in yaml_block.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("name:") {
+                    name = trimmed["name:".len()..].trim().trim_matches('"').trim_matches('\'').to_string();
+                }
+                if trimmed.starts_with("description:") {
+                    desc = trimmed["description:".len()..].trim().trim_matches('"').trim_matches('\'').to_string();
+                }
+            }
+            if !desc.is_empty() {
+                let result = if name.is_empty() { desc.clone() } else { format!("{} - {}", name, desc) };
+                if result.len() > 150 { return format!("{}...", &result[..150]); }
+                return result;
+            }
+        }
+    }
+
+    // Fallback: extract from markdown sections
+    let lines: Vec<&str> = content.lines().collect();
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    let mut current_section = String::new();
+    let mut current_content: Vec<String> = Vec::new();
+
+    for line in lines.iter().take(50) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+            if !current_section.is_empty() {
+                sections.push((current_section.clone(), current_content.clone()));
+            }
+            current_section = trimmed.trim_start_matches('#').trim().to_string();
+            current_content.clear();
+        } else if !trimmed.is_empty() && !trimmed.starts_with("---") && !trimmed.starts_with('`') {
+            current_content.push(trimmed.replace('*', "").replace('_', "").trim().to_string());
+            if current_content.len() >= 2 { break; }
+        }
+    }
+    if !current_section.is_empty() {
+        sections.push((current_section, current_content));
+    }
+
+    if sections.is_empty() {
+        // Take first few non-empty lines
+        let first_lines: Vec<&str> = lines.iter()
+            .take(5)
+            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("---"))
+            .map(|l| l.trim())
+            .collect();
+        let result = first_lines.join(" ");
+        if result.len() > 150 { return format!("{}...", &result[..150]); }
+        return result;
+    }
+
+    let parts: Vec<String> = sections.iter()
+        .take(2)
+        .map(|(title, lines)| format!("{}: {}", title, lines.join(" ")))
+        .collect();
+
+    let result = parts.join("; ");
+    if result.len() > 150 { format!("{}...", &result[..150]) } else { result }
+}
+
+/// Three-layer fallback description chain:
+/// Layer 1: README.md (repository level overview)
+/// Layer 2: SKILL.md (skill-level detail)
+/// Layer 3: Name-based inference (last resort)
+fn fetch_skill_description(
+    source: &str,
+    skill_id: &str,
+    name: &str,
+    proxy_url: Option<&str>,
+) -> String {
+    // Layer 1: Try README.md
+    if let Some(desc) = fetch_readme_description(source, proxy_url) {
+        log::info!("Fallback L1 (README) for {}/{}: OK", source, skill_id);
+        return desc;
+    }
+
+    // Layer 2: Try SKILL.md (individual retry, may succeed where batch failed)
+    if let Some(desc) = fetch_skill_md_fallback_description(source, skill_id, proxy_url) {
+        log::info!("Fallback L2 (SKILL.md) for {}/{}: OK", source, skill_id);
+        return desc;
+    }
+
+    // Layer 3: Name inference (last resort)
+    log::info!("Fallback L3 (name inference) for {}/{}", source, skill_id);
+    infer_description_from_name(skill_id, name)
+}
+
 /// Infer a description for a skill based on its name and skill ID.
 fn infer_description_from_name(skill_id: &str, name: &str) -> String {
     let combined = format!("{} {}", skill_id, name).to_lowercase();
@@ -856,6 +1068,129 @@ fn infer_description_from_name(skill_id: &str, name: &str) -> String {
 
     format!("技能库中的候选技能，涉及 {} 相关功能", name)
 }
+
+
+/// Calculate an enhanced score based on installs, keyword matching, AND README/content relevance.
+fn calculate_enhanced_score(
+    skill_id: &str,
+    name: &str,
+    installs: usize,
+    keywords: &[String],
+    content_summary: Option<&str>,
+    user_query: &str,
+) -> f64 {
+    // 1. Install-based score (max 4.0)
+    let install_score = if installs > 10000 { 4.0 }
+    else if installs > 5000 { 3.5 }
+    else if installs > 1000 { 3.0 }
+    else if installs > 500 { 2.5 }
+    else if installs > 100 { 2.0 }
+    else { 1.5 };
+
+    // 2. Keyword match bonus (max 2.0)
+    let combined = format!("{} {}", skill_id, name).to_lowercase();
+    let keyword_bonus: f64 = keywords.iter()
+        .filter(|kw| combined.contains(&kw.to_lowercase()))
+        .count() as f64 * 0.5;
+
+    // 3. Content relevance bonus (max 3.0) - from README or SKILL.md summary
+    let content_bonus = if let Some(summary) = content_summary {
+        let summary_lower = summary.to_lowercase();
+        let query_lower = user_query.to_lowercase();
+
+        // Check overlap between query words and content
+        let query_words: Vec<&str> = query_lower.split_whitespace()
+            .filter(|w| w.len() > 1)
+            .collect();
+
+        let match_count = query_words.iter()
+            .filter(|w| summary_lower.contains(*w))
+            .count();
+
+        (match_count as f64 * 0.6).min(3.0)
+    } else {
+        0.0
+    };
+
+    (install_score + keyword_bonus + content_bonus).min(10.0)
+}
+
+/// Generate enhanced recommendation reason based on content and installs.
+fn infer_recommendation_reason_enhanced(
+    query: &str,
+    skill_id: &str,
+    name: &str,
+    installs: usize,
+    keywords: &[String],
+    content_summary: Option<&str>,
+) -> String {
+    let install_desc = if installs > 10000 { "社区认可度极高" }
+    else if installs > 5000 { "社区认可度高" }
+    else if installs > 1000 { "热门" }
+    else if installs > 500 { "较受欢迎" }
+    else if installs > 100 { "有一定用户基础" }
+    else { "小众但有潜力" };
+
+    let combined = format!("{} {}", skill_id, name).to_lowercase();
+
+    // Check for keyword matches
+    let matched_keywords: Vec<&str> = keywords.iter()
+        .filter(|kw| combined.contains(&kw.to_lowercase()))
+        .map(|s| s.as_str())
+        .collect();
+
+    // If we have content summary (from README or SKILL.md), use it
+    if let Some(summary) = content_summary {
+        let summary_lower = summary.to_lowercase();
+        let query_lower = query.to_lowercase();
+
+        // Find concepts from the summary that match the query
+        let query_words: Vec<&str> = query_lower.split_whitespace()
+            .filter(|w| w.len() > 1)
+            .collect();
+
+        let matched_concepts: Vec<&str> = query_words.iter()
+            .filter(|w| summary_lower.contains(*w))
+            .map(|s| *s)
+            .collect();
+
+        if !matched_concepts.is_empty() {
+            let concepts_str = matched_concepts.join("、");
+            let brief = if summary.len() > 60 { &summary[..60] } else { summary };
+            return format!(
+                "简介：{}；与搜索需求匹配（「{}」）；{}技能（{} 次安装）",
+                brief, concepts_str, install_desc, installs
+            );
+        }
+
+        // Content exists but low direct relevance - show it anyway
+        let brief = if summary.len() > 80 { &summary[..80] } else { summary };
+        return format!(
+            "简介：{}；{}（{} 次安装），建议查看详情确认",
+            brief, install_desc, installs
+        );
+    }
+
+    // Fallback to keyword-based reason
+    if !matched_keywords.is_empty() {
+        let kw_str = matched_keywords.join("、");
+        format!("与搜索意图匹配，涵盖「{}」关键词；{}技能（{} 次安装）", kw_str, install_desc, installs)
+    } else {
+        let query_lower = query.to_lowercase();
+        let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+        let matched_query: Vec<&&str> = query_words.iter()
+            .filter(|w| w.len() > 1 && combined.contains(*w))
+            .collect();
+
+        if !matched_query.is_empty() {
+            let w_str = matched_query.iter().map(|s| **s).collect::<Vec<_>>().join("、");
+            format!("名称含「{}」关键词；{}（{} 次安装）", w_str, install_desc, installs)
+        } else {
+            format!("{}技能（{} 次安装）；建议查看详情确认是否符合需求", install_desc, installs)
+        }
+    }
+}
+
 
 /// Generate a recommendation reason based on the user query and skill metadata.
 fn infer_recommendation_reason(query: &str, skill_id: &str, name: &str, installs: usize, keywords: &[String]) -> String {
@@ -1080,17 +1415,22 @@ pub fn deep_search(
             verification_passed: skill_contents.len(),
         })
     } else {
-        // Fallback: return raw search results without AI analysis
-        // This ensures users still see candidate skills even when SKILL.md download fails
-        log::info!("Layer 4 - SKILL.md fetch failed for all candidates, returning raw search results as fallback");
+        // Fallback: return raw search results with enhanced descriptions
+        log::info!("Layer 4 - SKILL.md fetch failed, using 3-layer fallback chain for descriptions");
         channels_used.push("raw_fallback".to_string());
-        search_strategy = format!("{}_with_raw_fallback", search_strategy);
+        search_strategy = format!("{}_with_smart_fallback", search_strategy);
 
-        // Create intelligent analysis entries from the raw search results
         let fallback_analyses: Vec<AiSkillAnalysis> = top_skills.iter().map(|s| {
-            let description = infer_description_from_name(&s.skill_id, &s.name);
-            let reason = infer_recommendation_reason(query, &s.skill_id, &s.name, s.installs.try_into().unwrap_or(0), &keywords);
-            let score = calculate_fallback_score(&s.skill_id, &s.name, s.installs.try_into().unwrap_or(0), &keywords);
+            // Use 3-layer fallback chain: README -> SKILL.md -> name inference
+            let description = fetch_skill_description(&s.source, &s.skill_id, &s.name, proxy_url);
+
+            // Try to get content summary for enhanced scoring
+            let content_summary = fetch_readme_description(&s.source, proxy_url)
+                .or_else(|| fetch_skill_md_fallback_description(&s.source, &s.skill_id, proxy_url));
+
+            let install_count = s.installs.try_into().unwrap_or(0usize);
+            let score = calculate_enhanced_score(&s.skill_id, &s.name, install_count, &keywords, content_summary.as_deref(), query);
+            let reason = infer_recommendation_reason_enhanced(query, &s.skill_id, &s.name, install_count, &keywords, content_summary.as_deref());
 
             AiSkillAnalysis {
                 skill_id: s.skill_id.clone(),
@@ -1103,10 +1443,12 @@ pub fn deep_search(
             }
         }).collect();
 
-        log::info!("=== Deep search fallback complete: {} raw results ===", fallback_analyses.len());
+        log::info!("=== Deep search smart fallback complete: {} results ===", fallback_analyses.len());
 
         Ok(DeepSearchResult {
-            thinking: format!("{}\n\n[提示] SKILL.md 下载失败，以下为基础搜索结果", thinking),
+            thinking: format!("{}
+
+[提示] 使用智能兜底链生成描述（README → SKILL.md → 名称推断）", thinking),
             total_found,
             analyzed: fallback_analyses,
             search_strategy,
@@ -1123,9 +1465,11 @@ pub fn conversation_search(
     api_key: &str,
     original_query: &str,
     feedback: &str,
+    previous_skill_ids: &[String],
+    conversation_history: Option<&str>,
     proxy_url: Option<&str>,
 ) -> Result<DeepSearchResult> {
-    log::info!("=== Conversation search: original='{}', feedback='{}' ===", original_query, feedback);
+    log::info!("=== Conversation search: original='{}', feedback='{}', previous_count={}, has_history={} ===", original_query, feedback, previous_skill_ids.len(), conversation_history.is_some());
 
     let client = build_http_client(proxy_url, 15);
 
@@ -1145,7 +1489,7 @@ pub fn conversation_search(
         ("custom_feedback".to_string(), vec![])
     };
 
-    let mut thinking = String::new();
+    let thinking;
     let skills;
 
     // If we have keyword overrides, search directly
@@ -1154,9 +1498,9 @@ pub fn conversation_search(
         thinking = format!("根据反馈'{}'，使用预设关键词搜索", feedback);
         skills = multi_strategy_search(&client, original_query, &keywords_override);
     } else {
-        // Use AI to refine the search based on feedback
+        // Use AI to refine the search based on feedback, passing previous results to avoid duplicates
         log::info!("Using AI to refine search based on feedback");
-        match refine_query_with_feedback(api_url, api_key, original_query, feedback, proxy_url) {
+        match refine_query_with_feedback(api_url, api_key, original_query, feedback, previous_skill_ids, conversation_history, proxy_url) {
             Ok((t, refined_keywords)) => {
                 thinking = t;
                 skills = multi_strategy_search(&client, original_query, &refined_keywords);
@@ -1239,14 +1583,18 @@ pub fn conversation_search(
             verification_passed: skill_contents.len(),
         })
     } else {
-        // Fallback: return raw search results when SKILL.md download fails
-        log::info!("Conversation search: SKILL.md fetch failed, returning raw results as fallback");
+        // Fallback: return raw search results with enhanced descriptions
+        log::info!("Conversation search: SKILL.md fetch failed, using 3-layer fallback chain");
         channels_used.push("raw_fallback".to_string());
 
         let fallback_analyses: Vec<AiSkillAnalysis> = top_skills.iter().map(|s| {
-            let description = infer_description_from_name(&s.skill_id, &s.name);
-            let reason = infer_recommendation_reason(original_query, &s.skill_id, &s.name, s.installs.try_into().unwrap_or(0), &[]);
-            let score = calculate_fallback_score(&s.skill_id, &s.name, s.installs.try_into().unwrap_or(0), &[]);
+            let description = fetch_skill_description(&s.source, &s.skill_id, &s.name, proxy_url);
+            let content_summary = fetch_readme_description(&s.source, proxy_url)
+                .or_else(|| fetch_skill_md_fallback_description(&s.source, &s.skill_id, proxy_url));
+
+            let install_count = s.installs.try_into().unwrap_or(0usize);
+            let score = calculate_enhanced_score(&s.skill_id, &s.name, install_count, &[], content_summary.as_deref(), original_query);
+            let reason = infer_recommendation_reason_enhanced(original_query, &s.skill_id, &s.name, install_count, &[], content_summary.as_deref());
 
             AiSkillAnalysis {
                 skill_id: s.skill_id.clone(),
@@ -1259,10 +1607,12 @@ pub fn conversation_search(
             }
         }).collect();
 
-        log::info!("=== Conversation search fallback complete: {} raw results ===", fallback_analyses.len());
+        log::info!("=== Conversation search smart fallback complete: {} results ===", fallback_analyses.len());
 
         Ok(DeepSearchResult {
-            thinking: format!("{}\n\n[提示] SKILL.md 下载失败，以下为基础搜索结果", thinking),
+            thinking: format!("{}
+
+[提示] 使用智能兜底链生成描述（README → SKILL.md → 名称推断）", thinking),
             total_found,
             analyzed: fallback_analyses,
             search_strategy,
@@ -1278,6 +1628,8 @@ fn refine_query_with_feedback(
     api_key: &str,
     original_query: &str,
     feedback: &str,
+    previous_skill_ids: &[String],
+    conversation_history: Option<&str>,
     proxy_url: Option<&str>,
 ) -> Result<(String, Vec<String>)> {
     let client = build_http_client(proxy_url, 15);
@@ -1286,10 +1638,12 @@ fn refine_query_with_feedback(
 请根据反馈调整搜索策略，生成新的关键词。
 
 反馈类型:
-- '换一批'/'更多': 用户想要更多选项 → 生成不同但相关的关键词
+- '换一批'/'更多': 用户想要更多选项 → 生成不同但相关的关键词，必须避开已推荐过的技能
 - '太专业'/'太难'/'简单': 用户想要更简单的技能 → 生成基础/入门关键词
 - '高级'/'复杂'/'专业': 用户想要更专业的技能 → 生成高级关键词
 - 其他: 根据具体反馈调整
+
+重要：如果用户反馈是'换一批'，你必须避开已推荐过的技能，生成全新的、不同角度的关键词。
 
 输出格式:
 <think>
@@ -1301,9 +1655,22 @@ keyword3
 
 只返回思考过程和关键词，不要其他内容。";
 
+    let previous_context = if previous_skill_ids.is_empty() {
+        String::new()
+    } else {
+        let skill_list = previous_skill_ids.join(", ");
+        format!("\n已推荐过的技能（请避免重复）: {}\n", skill_list)
+    };
+
+    let conversation_history_context = if let Some(history) = conversation_history {
+        format!("\n\n对话历史:\n{}\n\n重要：请根据对话历史理解用户意图，如果反馈是'换一批'，请避开上述已推荐的技能。", history)
+    } else {
+        String::new()
+    };
+
     let user_prompt = format!(
-        "原始需求: {}\n用户反馈: {}\n\n请根据反馈调整搜索关键词。",
-        original_query, feedback
+        "原始需求: {}{}{}\n用户反馈: {}\n\n请根据反馈和对话历史调整搜索关键词，生成 3-5 个全新的英文搜索关键词。",
+        original_query, previous_context, conversation_history_context, feedback
     );
 
     let base_url = if api_url.is_empty() {

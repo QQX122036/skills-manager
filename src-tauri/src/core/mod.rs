@@ -21,4 +21,4 @@ pub mod sync_metadata;
 pub mod test_ai_search;
 pub mod tool_adapters;
 
-pub use ai_search_api::{fetch_skill_content, AiSkillAnalysis, DeepSearchResult, SkillContent};
+// Internal types for test_ai_search, not re-exported
