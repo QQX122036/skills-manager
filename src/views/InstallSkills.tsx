@@ -1147,14 +1147,25 @@ export function InstallSkills() {
                       {(() => {
                         const installedMatching = managedSkills.filter((skill) => {
                           if (skill.source_type !== "skillssh" || !skill.source_ref) return false;
-                          const sourceRef = skill.source_ref.toLowerCase();
+                          // source_ref format: "@owner/repo" or "owner/repo"
+                          const cleanRef = skill.source_ref.replace(/^@/, "");
+                          
+                          // Check if the installed skill is already in the AI results (same source + skill_id)
+                          const isAlreadyRecommended = deepSearchResults.some(
+                            (r) => {
+                              const aiFullRef = `${r.source}/${r.skillId}`;
+                              return aiFullRef === cleanRef || cleanRef.endsWith(`/${r.skillId}`);
+                            }
+                          );
+                          
+                          if (isAlreadyRecommended) return true;
+                          
+                          // Also check keyword match for non-recommended installed skills
                           const queryLower = debouncedMarketQuery.toLowerCase();
                           const keywords = queryLower.split(/\s+/).filter(k => k.length > 1);
-                          
-                          // Check if any keyword matches the skill name, source_ref, or description
                           return keywords.some(kw => 
                             skill.name.toLowerCase().includes(kw) ||
-                            sourceRef.includes(kw) ||
+                            skill.source_ref.toLowerCase().includes(kw) ||
                             (skill.description && skill.description.toLowerCase().includes(kw))
                           );
                         });

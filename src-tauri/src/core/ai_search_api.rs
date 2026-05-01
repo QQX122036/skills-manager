@@ -1208,44 +1208,68 @@ pub fn conversation_search(
         })
         .collect();
 
-    if skill_contents.is_empty() {
-        return Ok(DeepSearchResult {
-            thinking,
-            total_found,
-            analyzed: Vec::new(),
-            search_strategy,
-            channels_used,
-            verification_passed: 0,
-        });
-    }
+    log::info!("Conversation search: fetched {} SKILL.md out of {} candidates", skill_contents.len(), top_skills.len());
 
-    // Use feedback-aware analysis prompt
-    let mut analyzed = analyze_skills_with_feedback(original_query, feedback, &skill_contents, api_url, api_key, proxy_url)?;
+    if !skill_contents.is_empty() {
+        // Use feedback-aware analysis prompt
+        let mut analyzed = analyze_skills_with_feedback(original_query, feedback, &skill_contents, api_url, api_key, proxy_url)?;
 
-    // Fill in skill_name and source
-    for analysis in &mut analyzed {
-        if analysis.skill_name.is_empty() || analysis.source.is_empty() {
-            if let Some(sc) = skill_contents.iter().find(|s| s.skill_id == analysis.skill_id) {
-                if analysis.skill_name.is_empty() {
-                    analysis.skill_name = sc.name.clone();
-                }
-                if analysis.source.is_empty() {
-                    analysis.source = sc.source.clone();
+        // Fill in skill_name and source
+        for analysis in &mut analyzed {
+            if analysis.skill_name.is_empty() || analysis.source.is_empty() {
+                if let Some(sc) = skill_contents.iter().find(|s| s.skill_id == analysis.skill_id) {
+                    if analysis.skill_name.is_empty() {
+                        analysis.skill_name = sc.name.clone();
+                    }
+                    if analysis.source.is_empty() {
+                        analysis.source = sc.source.clone();
+                    }
                 }
             }
         }
+
+        log::info!("=== Conversation search complete: {} recommendations ===", analyzed.len());
+
+        Ok(DeepSearchResult {
+            thinking,
+            total_found,
+            analyzed,
+            search_strategy,
+            channels_used,
+            verification_passed: skill_contents.len(),
+        })
+    } else {
+        // Fallback: return raw search results when SKILL.md download fails
+        log::info!("Conversation search: SKILL.md fetch failed, returning raw results as fallback");
+        channels_used.push("raw_fallback".to_string());
+
+        let fallback_analyses: Vec<AiSkillAnalysis> = top_skills.iter().map(|s| {
+            let description = infer_description_from_name(&s.skill_id, &s.name);
+            let reason = infer_recommendation_reason(original_query, &s.skill_id, &s.name, s.installs.try_into().unwrap_or(0), &[]);
+            let score = calculate_fallback_score(&s.skill_id, &s.name, s.installs.try_into().unwrap_or(0), &[]);
+
+            AiSkillAnalysis {
+                skill_id: s.skill_id.clone(),
+                skill_name: s.name.clone(),
+                source: s.source.clone(),
+                score,
+                description,
+                how_to_use: "点击查看详情或安装后使用".to_string(),
+                reason,
+            }
+        }).collect();
+
+        log::info!("=== Conversation search fallback complete: {} raw results ===", fallback_analyses.len());
+
+        Ok(DeepSearchResult {
+            thinking: format!("{}\n\n[提示] SKILL.md 下载失败，以下为基础搜索结果", thinking),
+            total_found,
+            analyzed: fallback_analyses,
+            search_strategy,
+            channels_used,
+            verification_passed: 0,
+        })
     }
-
-    log::info!("=== Conversation search complete: {} recommendations ===", analyzed.len());
-
-    Ok(DeepSearchResult {
-        thinking,
-        total_found,
-        analyzed,
-        search_strategy,
-        channels_used,
-        verification_passed: skill_contents.len(),
-    })
 }
 
 /// Refine search query based on user feedback using AI.
