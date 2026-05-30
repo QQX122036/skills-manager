@@ -1,12 +1,45 @@
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const IGNORED: &[&str] = &[".git", ".DS_Store", "Thumbs.db", ".gitignore"];
 
-pub fn hash_directory(dir: &Path) -> Result<String> {
-    let mut hasher = Sha256::new();
+/// One file in a skill's canonical "content scope" — the set of files that
+/// both [`hash_directory`] and the source-diff command operate on. Sharing
+/// this enumeration keeps the update badge and the diff from ever
+/// disagreeing about which files count.
+pub struct ContentEntry {
+    /// Path relative to the scanned directory, in the same lossy form the
+    /// hash consumes (keeps the hashed byte stream stable).
+    pub relative_path: String,
+    pub path: PathBuf,
+    /// `mode & 0o111` on unix when metadata is readable, else `None`.
+    /// Always `None` on non-unix. `None` means "not folded into the hash".
+    pub exec_bits: Option<u32>,
+}
+
+impl ContentEntry {
+    pub fn is_executable(&self) -> bool {
+        self.exec_bits.map_or(false, |bits| bits != 0)
+    }
+}
+
+#[cfg(unix)]
+fn exec_bits_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata().ok().map(|m| m.permissions().mode() & 0o111)
+}
+
+#[cfg(not(unix))]
+fn exec_bits_of(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Enumerate the files that make up a skill's content, sorted by path and
+/// filtered by the shared ignore-list. Single source of truth for "what is
+/// skill content"; hashing and diffing both build on it.
+pub fn list_content_files(dir: &Path) -> Vec<ContentEntry> {
     let mut entries: Vec<_> = WalkDir::new(dir)
         .into_iter()
         .filter_entry(|e| {
@@ -19,24 +52,37 @@ pub fn hash_directory(dir: &Path) -> Result<String> {
 
     entries.sort_by(|a, b| a.path().cmp(b.path()));
 
-    for entry in entries {
-        let rel = entry
-            .path()
-            .strip_prefix(dir)
-            .unwrap_or(entry.path())
-            .to_string_lossy();
-        hasher.update(rel.as_bytes());
-        if let Ok(content) = std::fs::read(entry.path()) {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let relative_path = entry
+                .path()
+                .strip_prefix(dir)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .into_owned();
+            let exec_bits = exec_bits_of(entry.path());
+            ContentEntry {
+                relative_path,
+                path: entry.into_path(),
+                exec_bits,
+            }
+        })
+        .collect()
+}
+
+pub fn hash_directory(dir: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+
+    for entry in list_content_files(dir) {
+        hasher.update(entry.relative_path.as_bytes());
+        if let Ok(content) = std::fs::read(&entry.path) {
             hasher.update(&content);
         }
         // Include executable bit so permission-only changes are detected.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = entry.path().metadata() {
-                let mode = meta.permissions().mode();
-                hasher.update(&(mode & 0o111).to_le_bytes());
-            }
+        if let Some(bits) = entry.exec_bits {
+            hasher.update(&bits.to_le_bytes());
         }
     }
 
@@ -129,5 +175,36 @@ mod tests {
 
         let h2 = hash_directory(tmp2.path()).unwrap();
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn list_content_files_sorted_with_relative_paths_and_ignores() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/c.md"), "c").unwrap();
+        fs::write(tmp.path().join(".DS_Store"), "junk").unwrap();
+
+        let entries = list_content_files(tmp.path());
+        let rels: Vec<_> = entries.iter().map(|e| e.relative_path.clone()).collect();
+        // Sorted by path, ignore-listed files excluded, subdirs included.
+        assert_eq!(rels, vec!["a.txt", "b.txt", "sub/c.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_content_files_reports_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let script = tmp.path().join("run.sh");
+        fs::write(&script, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(tmp.path().join("plain.txt"), "x").unwrap();
+
+        let entries = list_content_files(tmp.path());
+        let by_name = |name: &str| entries.iter().find(|e| e.relative_path == name).unwrap();
+        assert!(by_name("run.sh").is_executable());
+        assert!(!by_name("plain.txt").is_executable());
     }
 }

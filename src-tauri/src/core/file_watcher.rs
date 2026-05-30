@@ -37,15 +37,15 @@ fn collect_watch_paths(store: &SkillStore) -> Vec<PathBuf> {
             let project_path = PathBuf::from(&project.path);
             seen_dirs.clear();
             for adapter in &adapters {
-                if adapter.relative_skills_dir.is_empty() {
+                let project_dir = adapter.project_relative_skills_dir();
+                if project_dir.is_empty() {
                     continue;
                 }
-                if !seen_dirs.insert(adapter.relative_skills_dir.clone()) {
+                if !seen_dirs.insert(project_dir.to_string()) {
                     continue;
                 }
-                let skills_dir = project_path.join(&adapter.relative_skills_dir);
-                let disabled_dir =
-                    project_path.join(format!("{}-disabled", &adapter.relative_skills_dir));
+                let skills_dir = project_path.join(project_dir);
+                let disabled_dir = project_path.join(format!("{}-disabled", project_dir));
                 // Only watch dirs that actually have skills inside. Watching the parent
                 // or empty leaf dirs would hold OS handles (Windows ReadDirectoryChangesW)
                 // and prevent users from deleting the agent-config folder (e.g. .codex)
@@ -118,7 +118,19 @@ fn sync_watch_set(
 }
 
 fn should_emit(event: &Event) -> bool {
-    !event.paths.is_empty()
+    if event.paths.is_empty() {
+        return false;
+    }
+    // Drop events that come exclusively from `.git/` subtrees. `git fetch`
+    // writes FETCH_HEAD/refs/packed-refs every time refreshGitStatus runs;
+    // forwarding those to the UI causes refreshAppData → setManagedSkills →
+    // refreshGitStatus to loop back into another fetch.
+    event.paths.iter().any(|p| !is_in_git_dir(p))
+}
+
+fn is_in_git_dir(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
 }
 
 pub fn start_file_watcher<R: tauri::Runtime>(app: tauri::AppHandle<R>, store: Arc<SkillStore>) {

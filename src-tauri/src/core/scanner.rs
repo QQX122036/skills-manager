@@ -41,9 +41,16 @@ fn is_symlink_to_central(path: &Path) -> bool {
     false
 }
 
-/// Recursively walk `dir` and collect all subdirectories that contain SKILL.md.
-/// Stops descending when a skill dir is found (skills don't nest). Guards
-/// against symlink cycles via a canonical-path visited set.
+/// Recursively walk `dir` and return all subdirectories that contain SKILL.md.
+/// Stops descending when a skill dir is found (skills don't nest). Skips
+/// `.git` / `node_modules` / `.hub` and guards against symlink cycles.
+pub fn collect_skill_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut results = Vec::new();
+    let mut visited = HashSet::new();
+    collect_skill_dirs_recursive(dir, &mut visited, &mut results);
+    results
+}
+
 fn collect_skill_dirs_recursive(
     dir: &Path,
     visited: &mut HashSet<PathBuf>,
@@ -159,33 +166,42 @@ pub fn scan_local_skills_with_adapters(
     let mut tools_scanned = 0;
 
     for adapter in adapters {
-        if !adapter.is_installed() {
+        let installed = adapter.is_installed();
+        let additional_dirs = adapter.additional_existing_scan_dirs();
+
+        // Discover via additional_scan_dirs even when the legacy detect dir is
+        // missing — handles tools whose skills land in a shared location
+        // (e.g. copilot → ~/.agents/skills) on machines without the legacy
+        // vendor dir.
+        if !installed && additional_dirs.is_empty() {
             continue;
         }
 
         tools_scanned += 1;
 
-        let primary_scan_dir = adapter.skills_dir();
-        if primary_scan_dir.exists() {
-            if adapter.recursive_scan {
-                scan_recursive_dir(
-                    &adapter.key,
-                    &primary_scan_dir,
-                    managed_paths,
-                    &mut discovered,
-                );
-            } else {
-                scan_flat_dir(
-                    &adapter.key,
-                    &primary_scan_dir,
-                    managed_paths,
-                    &mut discovered,
-                );
+        if installed {
+            let primary_scan_dir = adapter.skills_dir();
+            if primary_scan_dir.exists() {
+                if adapter.recursive_scan {
+                    scan_recursive_dir(
+                        &adapter.key,
+                        &primary_scan_dir,
+                        managed_paths,
+                        &mut discovered,
+                    );
+                } else {
+                    scan_flat_dir(
+                        &adapter.key,
+                        &primary_scan_dir,
+                        managed_paths,
+                        &mut discovered,
+                    );
+                }
             }
         }
 
         // Additional scan dirs are already resolved to concrete skills roots.
-        for scan_dir in adapter.additional_existing_scan_dirs() {
+        for scan_dir in additional_dirs {
             scan_flat_dir(&adapter.key, &scan_dir, managed_paths, &mut discovered);
         }
     }
@@ -347,6 +363,8 @@ mod tests {
             override_skills_dir: Some(tmp.path().to_string_lossy().to_string()),
             is_custom: true,
             recursive_scan: false,
+            project_relative_skills_dir: None,
+            category: Default::default(),
         };
 
         let plan = scan_local_skills_with_adapters(&[], &[adapter]).unwrap();
@@ -374,6 +392,8 @@ mod tests {
             override_skills_dir: Some(primary.to_string_lossy().to_string()),
             is_custom: true,
             recursive_scan: false,
+            project_relative_skills_dir: None,
+            category: Default::default(),
         };
 
         let adapter_with_extra = tool_adapters::ToolAdapter {

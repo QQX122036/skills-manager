@@ -3,8 +3,6 @@ import {
   Folder,
   FolderOpen,
   RefreshCw,
-  CheckCircle2,
-  Circle,
   Globe,
   Link as LinkIcon,
   Copy,
@@ -15,10 +13,12 @@ import {
   Sun,
   Moon,
   Monitor,
+  AlertTriangle,
   BookOpen,
+  Bug,
   Download,
+  FileArchive,
   Type,
-  Key,
   Pencil,
   RotateCcw,
   Plus,
@@ -27,17 +27,37 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  GripVertical,
 } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  useSortable,
+  arrayMove,
+  rectSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { listen } from "@tauri-apps/api/event";
+import { writeText as clipboardWriteText } from "@tauri-apps/plugin-clipboard-manager";
 import { check as checkUpdater } from "@tauri-apps/plugin-updater";
 import { open as dialogOpen, confirm as dialogConfirm } from "@tauri-apps/plugin-dialog";
 import { cn } from "../utils";
 import { useApp } from "../context/AppContext";
 import { useThemeContext } from "../context/ThemeContext";
+import { AgentIcon } from "../components/AgentIcon";
 import * as api from "../lib/tauri";
 import { applyTextSize } from "../lib/textScale";
+import { getErrorMessage } from "../lib/error";
 import type { AppUpdateInfo } from "../lib/tauri";
 import type { Theme } from "../hooks/useTheme";
 
@@ -50,6 +70,8 @@ const MAINSTREAM_AGENT_KEYS = new Set([
   "gemini_cli",
   "github_copilot",
   "opencode",
+  "hermes",
+  "openclaw",
   "windsurf",
   "kiro",
   "antigravity",
@@ -63,18 +85,94 @@ function compactHomePath(path: string) {
     .replace(/^[A-Za-z]:\\Users\\[^\\]+/, "~");
 }
 
+interface SortableAgentCardProps {
+  agentKey: string;
+  dragLabel: string;
+  children: (dragHandle: React.ReactNode) => React.ReactNode;
+}
+
+function SortableAgentCard({ agentKey, dragLabel, children }: SortableAgentCardProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    setActivatorNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: agentKey });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : undefined,
+  };
+
+  const handle = (
+    <button
+      type="button"
+      ref={setActivatorNodeRef}
+      {...listeners}
+      onClick={(e) => e.stopPropagation()}
+      className="mt-0.5 flex shrink-0 cursor-grab items-center justify-center rounded text-faint outline-none transition-colors hover:text-muted active:cursor-grabbing"
+      title={dragLabel}
+      aria-label={dragLabel}
+    >
+      <GripVertical className="h-3.5 w-3.5" />
+    </button>
+  );
+
+  return (
+    <div ref={setNodeRef} style={style} {...attributes}>
+      {children(handle)}
+    </div>
+  );
+}
+
+interface AgentGroupDndProps {
+  items: api.ToolInfo[];
+  sensors: ReturnType<typeof useSensors>;
+  dragLabel: string;
+  onDragEnd: (event: DragEndEvent, groupKeys: string[]) => void;
+  renderAgentCard: (agent: api.ToolInfo, dragHandle?: React.ReactNode) => React.ReactNode;
+}
+
+function AgentGroupDnd({ items, sensors, dragLabel, onDragEnd, renderAgentCard }: AgentGroupDndProps) {
+  const groupKeys = items.map((t) => t.key);
+  return (
+    <DndContext
+      sensors={sensors}
+      collisionDetection={closestCenter}
+      onDragEnd={(e) => onDragEnd(e, groupKeys)}
+    >
+      <SortableContext items={groupKeys} strategy={rectSortingStrategy}>
+        <div className="grid grid-cols-1 gap-1.5 md:grid-cols-2 xl:grid-cols-3">
+          {items.map((agent) => (
+            <SortableAgentCard key={agent.key} agentKey={agent.key} dragLabel={dragLabel}>
+              {(handle) => renderAgentCard(agent, handle)}
+            </SortableAgentCard>
+          ))}
+        </div>
+      </SortableContext>
+    </DndContext>
+  );
+}
+
 export function Settings() {
   const { t, i18n } = useTranslation();
-  const { tools, scenarios, refreshTools, openHelp } = useApp();
+  const { tools, presets, refreshTools, openHelp } = useApp();
   const [togglingTools, setTogglingTools] = useState<Set<string>>(new Set());
   const { theme, setTheme } = useThemeContext();
   const [syncMode, setSyncMode] = useState("symlink");
-  const [defaultScenario, setDefaultScenario] = useState("");
+  const [defaultPreset, setDefaultPreset] = useState("");
   const [closeAction, setCloseAction] = useState("");
   const [showTrayIcon, setShowTrayIcon] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [openingRepo, setOpeningRepo] = useState(false);
   const [openingGithub, setOpeningGithub] = useState(false);
+  const [reportingIssue, setReportingIssue] = useState(false);
+  const [exportingLogs, setExportingLogs] = useState(false);
+  const [lastPanic, setLastPanic] = useState<api.PanicInfo | null>(null);
   const [centralRepoPath, setCentralRepoPath] = useState("");
   const [centralRepoPathOverride, setCentralRepoPathOverride] = useState<string | null>(null);
   const [editingCentralRepoPath, setEditingCentralRepoPath] = useState(false);
@@ -88,13 +186,14 @@ export function Settings() {
   const [proxyInput, setProxyInput] = useState("");
   const [proxySaving, setProxySaving] = useState(false);
   const [textSize, setTextSize] = useState("default");
-  const [skillsmpApiKey, setSkillsmpApiKey] = useState("");
-  const [skillsmpSaving, setSkillsmpSaving] = useState(false);
   // AI API config (OpenAI-compatible: MiniMax, Ollama, etc.)
   const [aiApiUrl, setAiApiUrl] = useState("");
   const [aiApiUrlSaving, setAiApiUrlSaving] = useState(false);
   const [aiApiKey, setAiApiKey] = useState("");
   const [aiApiKeySaving, setAiApiKeySaving] = useState(false);
+  const [autoUpdateInterval, setAutoUpdateInterval] = useState("off");
+  const [autoUpdateApply, setAutoUpdateApply] = useState("off");
+  const [autoUpdateLastRun, setAutoUpdateLastRun] = useState<string | null>(null);
   // Agent path editing
   const [editingPathKey, setEditingPathKey] = useState<string | null>(null);
   const [editingPathValue, setEditingPathValue] = useState("");
@@ -216,8 +315,12 @@ export function Settings() {
   };
 
   useEffect(() => {
+    api.checkLastPanic().then(setLastPanic).catch(() => {});
+  }, []);
+
+  useEffect(() => {
     api.getSettings("sync_mode").then((v) => { if (v) setSyncMode(v); });
-    api.getSettings("default_scenario").then((v) => { if (v) setDefaultScenario(v); });
+    api.getSettings("default_scenario").then((v) => { if (v) setDefaultPreset(v); });
     api.getSettings("proxy_url").then((v) => { setProxyInput(v ?? ""); });
     api.getSettings("close_action").then((v) => { setCloseAction(v ?? ""); });
     api.getSettings("show_tray_icon").then((v) => {
@@ -225,9 +328,18 @@ export function Settings() {
       setShowTrayIcon(!(normalized === "false" || normalized === "0" || normalized === "no" || normalized === "off"));
     });
     api.getSettings("text_size").then((v) => { if (v) { setTextSize(v); applyTextSize(v); } });
-    api.getSettings("skillsmp_api_key").then((v) => { if (v) setSkillsmpApiKey(v); });
     api.getSettings("ai_api_url").then((v) => { if (v) setAiApiUrl(v); });
     api.getSettings("ai_api_key").then((v) => { if (v) setAiApiKey(v); });
+    api.getSettings("auto_update_check_interval").then((v) => { if (v) setAutoUpdateInterval(v); });
+    api.getSettings("auto_update_apply").then((v) => { if (v) setAutoUpdateApply(v); });
+    // The `skills-auto-updated` listener may populate this concurrently, so
+    // keep whichever timestamp is newer rather than blindly overwriting.
+    api.getSettings("auto_update_last_run_at").then((v) => {
+      if (!v) return;
+      setAutoUpdateLastRun((prev) =>
+        prev && Date.parse(prev) >= Date.parse(v) ? prev : v
+      );
+    });
     api.getCentralRepoPath().then((path) => {
       setCentralRepoPath(path);
       setCentralRepoPathInput(path);
@@ -289,8 +401,8 @@ export function Settings() {
     await api.setSettings("sync_mode", mode);
   };
 
-  const handleDefaultScenarioChange = async (id: string) => {
-    setDefaultScenario(id);
+  const handleDefaultPresetChange = async (id: string) => {
+    setDefaultPreset(id);
     await api.setSettings("default_scenario", id);
   };
 
@@ -320,6 +432,36 @@ export function Settings() {
     applyTextSize(size);
     api.setSettings("text_size", size);
   };
+
+  const handleAutoUpdateIntervalChange = async (value: string) => {
+    setAutoUpdateInterval(value);
+    await api.setSettings("auto_update_check_interval", value);
+  };
+
+  const handleAutoUpdateApplyChange = async (value: string) => {
+    setAutoUpdateApply(value);
+    await api.setSettings("auto_update_apply", value);
+  };
+
+  // Keep the last-run timestamp in sync with both the background scheduler
+  // and the tray's manual "Check for skill updates" so the user doesn't see
+  // a stale value if Settings is open. Backend always persists `last_run_at`
+  // first and then emits with the same `ran_at`, so reading from the payload
+  // avoids a follow-up DB roundtrip.
+  useEffect(() => {
+    type AutoUpdatedPayload = { ran_at?: string };
+    const unlistenPromise = listen<AutoUpdatedPayload>("skills-auto-updated", (event) => {
+      const ranAt = event.payload?.ran_at;
+      if (ranAt) {
+        setAutoUpdateLastRun(ranAt);
+      }
+    });
+    return () => {
+      unlistenPromise
+        .then((unlisten) => unlisten())
+        .catch(() => {});
+    };
+  }, []);
 
   const handleOpenRepoInFinder = async () => {
     try {
@@ -388,6 +530,122 @@ export function Settings() {
     }
   };
 
+  const handleExportLogs = async () => {
+    setExportingLogs(true);
+    try {
+      const result = await api.exportLogsZip();
+      toast.success(t("settings.exportLogsDone", { count: result.file_count }), {
+        description: result.zip_path,
+      });
+    } catch (error) {
+      console.error("Failed to export logs", error);
+      toast.error(t("settings.exportLogsFailed"));
+    } finally {
+      setExportingLogs(false);
+    }
+  };
+
+  const handleDismissPanic = async () => {
+    try {
+      await api.clearLastPanic();
+    } catch (err) {
+      console.warn("Failed to clear last_panic.log", err);
+    }
+    setLastPanic(null);
+  };
+
+  const handleReportIssue = async () => {
+    setReportingIssue(true);
+    try {
+      const [info, logExcerpt, panicInfo] = await Promise.all([
+        api.getDiagnosticInfo(),
+        api.getRecentLogExcerpt().catch((err) => {
+          console.warn("Failed to read log excerpt", err);
+          return null;
+        }),
+        api.checkLastPanic().catch(() => null),
+      ]);
+      const enabledBuiltin = enabledTools
+        .filter((tool) => !tool.is_custom)
+        .map((tool) => tool.key);
+      const enabledCustomCount = enabledTools.filter((tool) => tool.is_custom).length;
+      const agentsLine = enabledBuiltin.length === 0 && enabledCustomCount === 0
+        ? "(none)"
+        : [
+            enabledBuiltin.join(", "),
+            enabledCustomCount > 0 ? `${enabledCustomCount} custom` : "",
+          ].filter(Boolean).join(", ");
+      const parts = [
+        "**Diagnostics** (auto-collected by Skills Manager)",
+        "",
+        `- App version: \`${info.app_version}\``,
+        `- OS: \`${info.os} ${info.os_version} (${info.arch})\``,
+        `- UI locale: \`${i18n.language}\``,
+        `- Enabled agents: ${agentsLine}`,
+        `- Central repo: \`${info.central_repo_path}\`${info.central_repo_path_overridden ? " (custom path)" : ""}`,
+      ];
+      if (panicInfo) {
+        parts.push(
+          "",
+          `**Last panic** (${panicInfo.timestamp})`,
+          "",
+          "```",
+          panicInfo.message,
+          "```",
+        );
+      }
+      if (logExcerpt) {
+        parts.push(
+          "",
+          `**Recent log** (\`${logExcerpt.log_path}\`, ${logExcerpt.line_count} lines${logExcerpt.has_warnings ? ", includes warnings/errors" : ""})`,
+          "",
+          "```log",
+          logExcerpt.excerpt,
+          "```",
+          "",
+          `> ${t("settings.reportIssueExportHint")}`,
+        );
+      }
+      const md = parts.join("\n");
+      let copied = false;
+      try {
+        await clipboardWriteText(md);
+        copied = true;
+      } catch (err) {
+        console.error("Clipboard write failed", err);
+        try {
+          await navigator.clipboard.writeText(md);
+          copied = true;
+        } catch (err2) {
+          console.error("Browser clipboard fallback also failed", err2);
+        }
+      }
+      try {
+        await openUrl(`${GITHUB_URL}/issues/new?template=bug_report.md`);
+      } catch (err) {
+        console.error("Failed to open issue page", err);
+      }
+      if (copied) {
+        toast.success(t("settings.diagnosticsCopied"));
+        if (panicInfo) {
+          try {
+            await api.clearLastPanic();
+          } catch (err) {
+            console.warn("Failed to clear last_panic.log", err);
+          }
+          setLastPanic(null);
+        }
+      } else {
+        toast.message(t("settings.diagnosticsCopyManual"), { description: md });
+      }
+    } catch (error) {
+      console.error("Failed to prepare diagnostics", error);
+      toast.error(t("common.error"));
+    } finally {
+      setReportingIssue(false);
+    }
+  };
+
   const handleCheckUpdate = async () => {
     setCheckingUpdate(true);
     setUpdateInfo(null);
@@ -424,18 +682,6 @@ export function Settings() {
       }
     } finally {
       setInstalling(false);
-    }
-  };
-
-  const handleSaveSkillsmpApiKey = async () => {
-    setSkillsmpSaving(true);
-    try {
-      await api.setSettings("skillsmp_api_key", skillsmpApiKey.trim());
-      toast.success(t("common.success"));
-    } catch {
-      toast.error(t("common.error"));
-    } finally {
-      setSkillsmpSaving(false);
     }
   };
 
@@ -512,32 +758,48 @@ export function Settings() {
   );
   const customTools = useMemo(() => tools.filter((tool) => tool.is_custom), [tools]);
   const builtInTools = useMemo(() => tools.filter((tool) => !tool.is_custom), [tools]);
-  const sortTools = useCallback((items: typeof tools) => {
-    return [...items].sort((a, b) => {
-      const installRank = Number(b.installed) - Number(a.installed);
-      if (installRank !== 0) return installRank;
-      const enabledRank = Number(b.enabled) - Number(a.enabled);
-      if (enabledRank !== 0) return enabledRank;
-      return a.display_name.localeCompare(b.display_name);
-    });
-  }, []);
-  const displayedBuiltInTools = useMemo(() => sortTools(builtInTools), [builtInTools, sortTools]);
-  const displayedCustomTools = useMemo(() => sortTools(customTools), [customTools, sortTools]);
   const mainstreamTools = useMemo(
-    () => displayedBuiltInTools.filter((tool) => MAINSTREAM_AGENT_KEYS.has(tool.key)),
-    [displayedBuiltInTools]
+    () => builtInTools.filter((tool) => MAINSTREAM_AGENT_KEYS.has(tool.key)),
+    [builtInTools]
   );
   const secondaryTools = useMemo(
-    () => displayedBuiltInTools.filter((tool) => !MAINSTREAM_AGENT_KEYS.has(tool.key)),
-    [displayedBuiltInTools]
+    () => builtInTools.filter((tool) => !MAINSTREAM_AGENT_KEYS.has(tool.key)),
+    [builtInTools]
+  );
+
+  const dragSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  const handleAgentDragEnd = useCallback(
+    async (event: DragEndEvent, groupKeys: string[]) => {
+      const { active, over } = event;
+      if (!over || active.id === over.id) return;
+      const oldIdx = groupKeys.indexOf(String(active.id));
+      const newIdx = groupKeys.indexOf(String(over.id));
+      if (oldIdx < 0 || newIdx < 0) return;
+
+      const newGroupKeys = arrayMove(groupKeys, oldIdx, newIdx);
+      const fullOrder = tools.map((t) => t.key);
+      const groupKeySet = new Set(groupKeys);
+      let cursor = 0;
+      const newFullOrder = fullOrder.map((k) =>
+        groupKeySet.has(k) ? newGroupKeys[cursor++] : k
+      );
+
+      try {
+        await api.setToolOrder(newFullOrder);
+        await refreshTools();
+      } catch (e) {
+        toast.error(getErrorMessage(e, t("common.error")));
+      }
+    },
+    [tools, refreshTools, t]
   );
   const displayedRepoPath = centralRepoPath
     ? compactHomePath(centralRepoPath)
     : t("common.loading");
 
-  const renderAgentCard = (agent: typeof tools[number]) => (
+  const renderAgentCard = (agent: typeof tools[number], dragHandle?: React.ReactNode) => (
     <div
-      key={agent.key}
       className={cn(
         "group relative flex flex-col gap-1.5 rounded-[6px] border px-3 py-2.5 transition-colors",
         agent.installed && agent.enabled
@@ -548,24 +810,40 @@ export function Settings() {
       )}
     >
       <div className="flex items-start gap-2">
+        {dragHandle}
         <div className="mt-0.5 shrink-0">
           {agent.installed ? (
             <button
+              type="button"
+              role="switch"
+              aria-checked={agent.enabled}
               onClick={() => handleToggleTool(agent.key, !agent.enabled)}
               disabled={togglingTools.has(agent.key)}
-              className="shrink-0 outline-none"
               title={agent.enabled ? t("settings.disableAgent") : t("settings.enableAgent")}
-            >
-              {togglingTools.has(agent.key) ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin text-muted" />
-              ) : agent.enabled ? (
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
-              ) : (
-                <Circle className="h-3.5 w-3.5 text-amber-500" />
+              className={cn(
+                "relative inline-flex h-4 w-7 shrink-0 items-center rounded-full outline-none transition-colors focus-visible:ring-2 focus-visible:ring-accent",
+                agent.enabled ? "bg-emerald-500" : "bg-zinc-300 dark:bg-zinc-600",
+                togglingTools.has(agent.key) ? "cursor-wait opacity-60" : "cursor-pointer"
               )}
+            >
+              <span
+                className={cn(
+                  "inline-flex h-3 w-3 items-center justify-center rounded-full bg-white shadow transition-transform",
+                  agent.enabled ? "translate-x-3.5" : "translate-x-0.5"
+                )}
+              >
+                {togglingTools.has(agent.key) && (
+                  <Loader2 className="h-2 w-2 animate-spin text-muted" />
+                )}
+              </span>
             </button>
           ) : (
-            <Circle className="h-3.5 w-3.5 text-faint" />
+            <div
+              title={t("settings.notInstalled") as string}
+              className="relative inline-flex h-4 w-7 shrink-0 items-center rounded-full bg-zinc-200 opacity-60 dark:bg-zinc-700"
+            >
+              <span className="inline-flex h-3 w-3 translate-x-0.5 rounded-full bg-white/80 shadow" />
+            </div>
           )}
         </div>
 
@@ -573,6 +851,11 @@ export function Settings() {
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
+                <AgentIcon
+                  agentKey={agent.key}
+                  displayName={agent.display_name}
+                  className="h-5 w-5 rounded-[5px]"
+                />
                 <h3 className={cn("truncate text-[13px] font-medium", agent.installed ? "text-secondary" : "text-muted")}>
                   {agent.display_name}
                 </h3>
@@ -865,9 +1148,13 @@ export function Settings() {
                 <h3 className="text-[13px] font-medium text-secondary">{t("settings.builtInAgents")}</h3>
                 <span className="text-[12px] text-muted">{mainstreamTools.length}</span>
               </div>
-              <div className="grid grid-cols-1 gap-1.5 md:grid-cols-2 xl:grid-cols-3">
-                {mainstreamTools.map(renderAgentCard)}
-              </div>
+              <AgentGroupDnd
+                items={mainstreamTools}
+                sensors={dragSensors}
+                dragLabel={t("settings.dragToReorder")}
+                onDragEnd={handleAgentDragEnd}
+                renderAgentCard={renderAgentCard}
+              />
             </div>
 
             {secondaryTools.length > 0 && (
@@ -881,22 +1168,30 @@ export function Settings() {
                   {t("settings.moreAgentsSection", { count: secondaryTools.length })}
                 </button>
                 {showMoreAgents && (
-                  <div className="grid grid-cols-1 gap-1.5 md:grid-cols-2 xl:grid-cols-3">
-                    {secondaryTools.map(renderAgentCard)}
-                  </div>
+                  <AgentGroupDnd
+                    items={secondaryTools}
+                    sensors={dragSensors}
+                    dragLabel={t("settings.dragToReorder")}
+                    onDragEnd={handleAgentDragEnd}
+                    renderAgentCard={renderAgentCard}
+                  />
                 )}
               </div>
             )}
 
-            {displayedCustomTools.length > 0 && (
+            {customTools.length > 0 && (
               <div>
                 <div className="mb-2 flex items-center justify-between gap-2">
                   <h3 className="text-[13px] font-medium text-secondary">{t("settings.customAgentsSection")}</h3>
-                  <span className="text-[12px] text-muted">{displayedCustomTools.length}</span>
+                  <span className="text-[12px] text-muted">{customTools.length}</span>
                 </div>
-                <div className="grid grid-cols-1 gap-1.5 md:grid-cols-2 xl:grid-cols-3">
-                  {displayedCustomTools.map(renderAgentCard)}
-                </div>
+                <AgentGroupDnd
+                  items={customTools}
+                  sensors={dragSensors}
+                  dragLabel={t("settings.dragToReorder")}
+                  onDragEnd={handleAgentDragEnd}
+                  renderAgentCard={renderAgentCard}
+                />
               </div>
             )}
           </div>
@@ -1106,20 +1401,20 @@ export function Settings() {
               </div>
             </div>
 
-            {/* Default scenario */}
+            {/* Default preset */}
             <div className="flex flex-wrap items-start justify-between gap-3 px-4 py-3">
               <div className="min-w-0 flex-1">
-                <h3 className="text-[13px] text-secondary font-medium mb-0.5">{t("settings.defaultScenario")}</h3>
-                <p className="text-[13px] text-muted">{t("settings.defaultScenarioDesc")}</p>
+                <h3 className="text-[13px] text-secondary font-medium mb-0.5">{t("settings.defaultPreset")}</h3>
+                <p className="text-[13px] text-muted">{t("settings.defaultPresetDesc")}</p>
               </div>
               <div className="relative shrink-0">
                 <select
-                  value={defaultScenario}
-                  onChange={(e) => handleDefaultScenarioChange(e.target.value)}
+                  value={defaultPreset}
+                  onChange={(e) => handleDefaultPresetChange(e.target.value)}
                   className={selectClass}
                 >
                   <option value="">—</option>
-                  {scenarios.map((s) => (
+                  {presets.map((s) => (
                     <option key={s.id} value={s.id}>{s.name}</option>
                   ))}
                 </select>
@@ -1240,46 +1535,54 @@ export function Settings() {
           </div>
         </section>
 
-        {/* SkillsMP API Key */}
+        {/* Skill auto-update */}
         <section>
           <h2 className="app-section-title mb-3">
-            {t("settings.skillsmpTitle", { defaultValue: "SkillsMP AI Search" })}
+            {t("settings.autoUpdate.title")}
           </h2>
           <div className="app-panel overflow-hidden divide-y divide-border-subtle">
-            <div className="px-4 py-3">
-              <h3 className="text-[13px] text-secondary font-medium mb-0.5">{t("settings.skillsmpApiKey", { defaultValue: "API Key" })}</h3>
-              <p className="text-[13px] text-muted mb-2">
-                {t("settings.skillsmpDesc", { defaultValue: "Enter your SkillsMP API key to enable AI-powered skill search." })}{" "}
-                <button
-                  type="button"
-                  onClick={() => openUrl("https://skillsmp.com/docs/api")}
-                  className="inline-flex items-center gap-0.5 text-accent-light hover:underline"
-                >
-                  {t("settings.skillsmpGetKey", { defaultValue: "Get your API key" })}
-                  <ExternalLink className="h-3 w-3" />
-                </button>
-              </p>
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  type="password"
-                  value={skillsmpApiKey}
-                  onChange={(e) => setSkillsmpApiKey(e.target.value)}
-                  placeholder="sk_live_..."
-                  className={`${fieldClass} min-w-0 flex-1 font-mono`}
-                />
-                <button
-                  onClick={handleSaveSkillsmpApiKey}
-                  disabled={skillsmpSaving}
-                  className={`${actionButtonClass} bg-surface-hover hover:bg-surface-active text-tertiary border-border`}
-                >
-                  {skillsmpSaving ? (
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                  ) : (
-                    <Key className="w-3 h-3" />
-                  )}
-                  {t("common.save")}
-                </button>
+            <div className="flex items-center justify-between gap-4 px-4 py-2.5">
+              <div className="min-w-0">
+                <h3 className="text-[13px] text-secondary font-medium">
+                  {t("settings.autoUpdate.intervalLabel")}
+                </h3>
+                <p className="text-[12px] text-muted">
+                  {t("settings.autoUpdate.intervalDesc")}
+                  {autoUpdateLastRun
+                    ? ` · ${t("settings.autoUpdate.lastRun", {
+                        time: new Date(autoUpdateLastRun).toLocaleString(),
+                      })}`
+                    : ""}
+                </p>
               </div>
+              <select
+                value={autoUpdateInterval}
+                onChange={(e) => handleAutoUpdateIntervalChange(e.target.value)}
+                className={`${fieldClass} shrink-0`}
+              >
+                <option value="off">{t("settings.autoUpdate.intervalOff")}</option>
+                <option value="1h">{t("settings.autoUpdate.interval1h")}</option>
+                <option value="6h">{t("settings.autoUpdate.interval6h")}</option>
+                <option value="24h">{t("settings.autoUpdate.interval24h")}</option>
+              </select>
+            </div>
+            <div className="flex items-center justify-between gap-4 px-4 py-2.5">
+              <div className="min-w-0">
+                <h3 className="text-[13px] text-secondary font-medium">
+                  {t("settings.autoUpdate.applyLabel")}
+                </h3>
+                <p className="text-[12px] text-muted">
+                  {t("settings.autoUpdate.applyDesc")}
+                </p>
+              </div>
+              <select
+                value={autoUpdateApply}
+                onChange={(e) => handleAutoUpdateApplyChange(e.target.value)}
+                className={`${fieldClass} shrink-0`}
+              >
+                <option value="off">{t("settings.autoUpdate.applyOff")}</option>
+                <option value="on">{t("settings.autoUpdate.applyOn")}</option>
+              </select>
             </div>
           </div>
         </section>
@@ -1391,7 +1694,37 @@ export function Settings() {
         </section>
 
         {/* About */}
-        <section>
+        <section className="space-y-2">
+          {lastPanic && (
+            <div className="app-panel flex flex-wrap items-center justify-between gap-2 p-3 border border-red-500/40 bg-red-500/10">
+              <div className="flex min-w-0 items-center gap-2 text-[13px] text-red-700 dark:text-red-300">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>{t("settings.panicBanner", { time: lastPanic.timestamp })}</span>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={handleReportIssue}
+                  disabled={reportingIssue}
+                  className={`${actionButtonClass} bg-red-600 hover:bg-red-700 text-white border-red-600`}
+                >
+                  {reportingIssue ? (
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                  ) : (
+                    <Bug className="w-3 h-3" />
+                  )}
+                  {t("settings.reportIssue")}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDismissPanic}
+                  className={`${actionButtonClass} bg-surface-hover hover:bg-surface-active text-tertiary border-border`}
+                >
+                  {t("settings.panicDismiss")}
+                </button>
+              </div>
+            </div>
+          )}
           <div className="app-panel flex flex-wrap items-start justify-between gap-3 p-4">
             <div className="flex min-w-0 flex-1 items-center gap-3">
               <div className="w-8 h-8 rounded-lg bg-surface-hover border border-border flex items-center justify-center">
@@ -1464,6 +1797,34 @@ export function Settings() {
                 className={`${actionButtonClass} bg-surface-hover hover:bg-surface-active text-tertiary border-border`}
               >
                 <BookOpen className="w-3 h-3" /> {t("settings.help")}
+              </button>
+              <button
+                type="button"
+                onClick={handleReportIssue}
+                disabled={reportingIssue}
+                title={t("settings.reportIssueHint")}
+                className={`${actionButtonClass} bg-surface-hover hover:bg-surface-active text-tertiary border-border`}
+              >
+                {reportingIssue ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Bug className="w-3 h-3" />
+                )}
+                {t("settings.reportIssue")}
+              </button>
+              <button
+                type="button"
+                onClick={handleExportLogs}
+                disabled={exportingLogs}
+                title={t("settings.exportLogsHint")}
+                className={`${actionButtonClass} bg-surface-hover hover:bg-surface-active text-tertiary border-border`}
+              >
+                {exportingLogs ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <FileArchive className="w-3 h-3" />
+                )}
+                {t("settings.exportLogs")}
               </button>
               <button
                 type="button"

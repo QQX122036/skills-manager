@@ -19,6 +19,7 @@ const packagePath = path.join(root, 'package.json');
 const tauriConfPath = path.join(root, 'src-tauri', 'tauri.conf.json');
 const enI18nPath = path.join(root, 'src', 'i18n', 'en.json');
 const zhI18nPath = path.join(root, 'src', 'i18n', 'zh.json');
+const zhTwI18nPath = path.join(root, 'src', 'i18n', 'zh-TW.json');
 const changelogPath = path.join(root, 'CHANGELOG.md');
 const changelogZhPath = path.join(root, 'CHANGELOG-zh.md');
 
@@ -73,8 +74,8 @@ function ensureChangelogEntry(changelog, nextVersion, { zh = false } = {}) {
   }
 
   const sections = zh
-    ? ['### 新增', '- ', '', '### 变更', '- ', '', '### 修复', '- ', '', '### 移除', '- ']
-    : ['### Added', '- ', '', '### Changed', '- ', '', '### Fixed', '- ', '', '### Removed', '- '];
+    ? ['### 发布概览', '- ', '', '### 用户可见更新', '- ', '', '### 开发者与治理更新', '- ']
+    : ['### Release Overview', '- ', '', '### User-facing', '- ', '', '### Developer & Governance', '- '];
 
   const entry = [heading, '', ...sections, ''].join('\n');
 
@@ -91,6 +92,7 @@ function main() {
   const tauriConf = readJson(tauriConfPath);
   const en = readJson(enI18nPath);
   const zh = readJson(zhI18nPath);
+  const zhTw = readJson(zhTwI18nPath);
   const changelog = fs.readFileSync(changelogPath, 'utf8');
   const changelogZh = fs.readFileSync(changelogZhPath, 'utf8');
 
@@ -101,6 +103,7 @@ function main() {
   tauriConf.version = nextVersion;
   updateSettingsVersion(en, nextVersion, 'src/i18n/en.json');
   updateSettingsVersion(zh, nextVersion, 'src/i18n/zh.json');
+  updateSettingsVersion(zhTw, nextVersion, 'src/i18n/zh-TW.json');
   const nextChangelog = ensureChangelogEntry(changelog, nextVersion);
   const nextChangelogZh = ensureChangelogEntry(changelogZh, nextVersion, { zh: true });
 
@@ -113,6 +116,7 @@ function main() {
   writeJson(tauriConfPath, tauriConf);
   writeJson(enI18nPath, en);
   writeJson(zhI18nPath, zh);
+  writeJson(zhTwI18nPath, zhTw);
   fs.writeFileSync(changelogPath, nextChangelog);
   fs.writeFileSync(changelogZhPath, nextChangelogZh);
 
@@ -124,6 +128,7 @@ function main() {
   console.log('- src-tauri/tauri.conf.json');
   console.log('- src/i18n/en.json');
   console.log('- src/i18n/zh.json');
+  console.log('- src/i18n/zh-TW.json');
 }
 
 main();

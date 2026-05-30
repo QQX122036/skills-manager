@@ -168,7 +168,7 @@ fn detect_upstream_health(dir: &Path, has_remote: bool) -> String {
 /// Initialize a new git repository in the skills directory.
 #[allow(dead_code)]
 pub fn init_repo(skills_dir: &Path) -> Result<()> {
-    let _lock = RepoLock::acquire(skills_dir, "git init")?;
+    let _lock = RepoLock::acquire("git init")?;
     init_repo_unlocked(skills_dir)
 }
 
@@ -194,7 +194,7 @@ pub(crate) fn init_repo_unlocked(skills_dir: &Path) -> Result<()> {
 
 /// Set (or update) the remote origin URL.
 pub fn set_remote(skills_dir: &Path, url: &str) -> Result<()> {
-    let _lock = RepoLock::acquire(skills_dir, "git set remote")?;
+    let _lock = RepoLock::acquire("git set remote")?;
     set_remote_unlocked(skills_dir, url)
 }
 
@@ -230,7 +230,7 @@ pub(crate) fn set_remote_unlocked(skills_dir: &Path, url: &str) -> Result<()> {
 /// Stage all changes and create a commit.
 #[allow(dead_code)]
 pub fn commit_all(skills_dir: &Path, message: &str) -> Result<()> {
-    let _lock = RepoLock::acquire(skills_dir, "git commit")?;
+    let _lock = RepoLock::acquire("git commit")?;
     commit_all_unlocked(skills_dir, message)
 }
 
@@ -252,7 +252,7 @@ pub(crate) fn commit_all_unlocked(skills_dir: &Path, message: &str) -> Result<()
 
 /// Push to the remote repository.
 pub fn push(skills_dir: &Path) -> Result<()> {
-    let _lock = RepoLock::acquire(skills_dir, "git push")?;
+    let _lock = RepoLock::acquire("git push")?;
     push_unlocked(skills_dir)
 }
 
@@ -315,7 +315,7 @@ pub(crate) fn push_unlocked(skills_dir: &Path) -> Result<()> {
 /// Pull from the remote repository.
 #[allow(dead_code)]
 pub fn pull(skills_dir: &Path) -> Result<()> {
-    let _lock = RepoLock::acquire(skills_dir, "git pull")?;
+    let _lock = RepoLock::acquire("git pull")?;
     pull_unlocked(skills_dir)
 }
 
@@ -332,7 +332,7 @@ pub(crate) fn pull_unlocked(skills_dir: &Path) -> Result<()> {
 
 /// Create an annotated snapshot tag on current HEAD.
 pub fn create_snapshot_tag(skills_dir: &Path) -> Result<String> {
-    let _lock = RepoLock::acquire(skills_dir, "git snapshot")?;
+    let _lock = RepoLock::acquire("git snapshot")?;
     create_snapshot_tag_unlocked(skills_dir)
 }
 
@@ -420,7 +420,7 @@ pub fn list_snapshot_versions(
 /// Restore skills files to a snapshot tag by creating a new restore commit.
 #[allow(dead_code)]
 pub fn restore_snapshot_version(skills_dir: &Path, tag: &str) -> Result<()> {
-    let _lock = RepoLock::acquire(skills_dir, "git restore snapshot")?;
+    let _lock = RepoLock::acquire("git restore snapshot")?;
     restore_snapshot_version_unlocked(skills_dir, tag)
 }
 
@@ -492,8 +492,53 @@ pub(crate) fn restore_snapshot_version_unlocked(skills_dir: &Path, tag: &str) ->
 /// The skills directory must be empty or non-existent.
 #[allow(dead_code)]
 pub fn clone_into(skills_dir: &Path, url: &str) -> Result<()> {
-    let _lock = RepoLock::acquire(skills_dir, "git clone")?;
+    let _lock = RepoLock::acquire("git clone")?;
     clone_into_unlocked(skills_dir, url)
+}
+
+/// Clone variant that refuses to merge a populated non-git directory into the
+/// cloned repo. Used by agent-facing entry points (e.g. CLI `--skills-root`)
+/// where an accidental pointing at an unrelated populated directory would
+/// otherwise silently absorb its contents.
+///
+/// The check runs inside the same `RepoLock` as the clone, so any other
+/// skills-manager process attempting to populate the target between check
+/// and clone is serialized.
+pub fn clone_into_strict(skills_dir: &Path, url: &str) -> Result<()> {
+    let _lock = RepoLock::acquire("git clone")?;
+    ensure_clean_clone_target(skills_dir)?;
+    clone_into_unlocked(skills_dir, url)
+}
+
+/// Refuse a clone target that is a file, or a non-empty directory that is not
+/// already a git repo. An empty or non-existent target is fine, and an
+/// existing `.git` is left to `clone_into_unlocked` to reject with its own
+/// message. Pure logic — no locking — so callers must hold their own lock if
+/// they need atomicity with a subsequent operation.
+fn ensure_clean_clone_target(skills_dir: &Path) -> Result<()> {
+    if !skills_dir.exists() {
+        return Ok(());
+    }
+    if skills_dir.join(".git").exists() {
+        return Ok(());
+    }
+    if skills_dir.is_file() {
+        anyhow::bail!(
+            "refusing to clone into {}: path exists and is a file, not a directory",
+            skills_dir.display()
+        );
+    }
+    let mut entries = std::fs::read_dir(skills_dir)
+        .with_context(|| format!("Failed to read clone target {}", skills_dir.display()))?;
+    if entries.next().is_some() {
+        anyhow::bail!(
+            "refusing to clone into {}: directory is non-empty and not a git repo. \
+             Files in the target would be silently merged into the cloned repo. \
+             Point the target at an empty or non-existent directory.",
+            skills_dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Reset a local repo by clearing its `.git` then cloning from the remote.
@@ -579,16 +624,16 @@ pub(crate) fn clone_into_unlocked(skills_dir: &Path, url: &str) -> Result<()> {
     };
 
     // Clone
-    let status = git_command()
+    let output = git_command()
         .arg("clone")
         .arg(url)
         .arg(skills_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .status();
+        .output();
 
-    match status {
-        Ok(s) if s.success() => {
+    match output {
+        Ok(o) if o.status.success() => {
             // Merge back any existing skills that don't conflict
             if let Some(backup) = backup_dir {
                 merge_backup(&backup, skills_dir).with_context(|| {
@@ -601,13 +646,24 @@ pub(crate) fn clone_into_unlocked(skills_dir: &Path, url: &str) -> Result<()> {
             }
             Ok(())
         }
-        _ => {
+        result => {
             // Restore backup on failure
             if let Some(backup) = backup_dir {
                 let _ = std::fs::remove_dir_all(skills_dir);
                 let _ = std::fs::rename(&backup, skills_dir);
             }
-            anyhow::bail!("Failed to clone repository")
+            match result {
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    let detail = stderr.trim();
+                    if detail.is_empty() {
+                        anyhow::bail!("git clone failed with exit code {}", o.status)
+                    } else {
+                        anyhow::bail!("git clone failed: {}", redact_urls_in_text(detail))
+                    }
+                }
+                Err(e) => Err(anyhow::Error::new(e).context("Failed to spawn git clone")),
+            }
         }
     }
 }
@@ -655,11 +711,11 @@ fn ensure_gitignore(skills_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn with_repo_lock<T, F>(repo_root: &Path, operation: &str, f: F) -> Result<T>
+pub(crate) fn with_repo_lock<T, F>(operation: &str, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
-    let _lock = RepoLock::acquire(repo_root, operation)?;
+    let _lock = RepoLock::acquire(operation)?;
     f()
 }
 
@@ -878,11 +934,108 @@ mod tests {
     }
 
     #[test]
+    fn clone_into_unlocked_failure_includes_git_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("clone-target");
+        // file:// URL pointing at a non-existent path -> git clone fails with
+        // a deterministic stderr message we can pattern-match on.
+        let bogus_src = tmp.path().join("does-not-exist.git");
+        let url = format!("file://{}", bogus_src.display());
+
+        let err = clone_into_unlocked(&target, &url).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("git clone failed"),
+            "expected git stderr to be surfaced, got: {msg}"
+        );
+        assert!(
+            !msg.eq("Failed to clone repository"),
+            "error must not be the old generic placeholder"
+        );
+    }
+
+    #[test]
+    fn clone_into_unlocked_failure_redacts_credentials_in_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("clone-target");
+        // Unreachable host with a token-bearing URL. git's stderr typically
+        // echoes the URL back; the error must not leak the token.
+        let url = "https://ghp_supersecrettoken123@127.0.0.1:1/does-not-exist.git";
+
+        let err = clone_into_unlocked(&target, url).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("ghp_supersecrettoken123"),
+            "credential must not leak into error message: {msg}"
+        );
+    }
+
+    #[test]
     fn parse_restored_tag_with_trailing_whitespace() {
         let msg = "restore: switch skills library to sm-v-20260318-153012-abc1234  ";
         assert_eq!(
             parse_restored_from_tag_message(msg).as_deref(),
             Some("sm-v-20260318-153012-abc1234")
+        );
+    }
+
+    // ── ensure_clean_clone_target ──
+    // Tested directly (without RepoLock) so cases run in parallel without
+    // serializing on the process-wide clone lock.
+
+    #[test]
+    fn ensure_clean_clone_target_allows_nonexistent_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("not-yet");
+        ensure_clean_clone_target(&target).unwrap();
+    }
+
+    #[test]
+    fn ensure_clean_clone_target_allows_empty_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("empty");
+        std::fs::create_dir_all(&target).unwrap();
+        ensure_clean_clone_target(&target).unwrap();
+    }
+
+    #[test]
+    fn ensure_clean_clone_target_allows_existing_git_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("existing-repo");
+        std::fs::create_dir_all(target.join(".git")).unwrap();
+        std::fs::write(target.join("README"), b"x").unwrap();
+        // Existing .git is delegated to clone_into_unlocked's own rejection.
+        ensure_clean_clone_target(&target).unwrap();
+    }
+
+    #[test]
+    fn ensure_clean_clone_target_refuses_non_empty_non_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("populated");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("user-file.txt"), b"important").unwrap();
+
+        let err = ensure_clean_clone_target(&target).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("non-empty") && msg.contains("not a git repo"),
+            "unexpected message: {msg}"
+        );
+        // Crucial: the user file must still be there.
+        assert!(target.join("user-file.txt").exists());
+    }
+
+    #[test]
+    fn ensure_clean_clone_target_refuses_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("a-file");
+        std::fs::write(&target, b"x").unwrap();
+
+        let err = ensure_clean_clone_target(&target).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("file, not a directory"),
+            "unexpected message: {msg}"
         );
     }
 }

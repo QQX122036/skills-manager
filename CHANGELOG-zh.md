@@ -5,6 +5,175 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.22.4] - 2026-05-30
+
+### 发布概览
+- 一个修复版本：把全局工作区的技能上传到技能仓库后，卡片上消失的删除/管理按钮重新出现；同时让「有可用更新」徽标和 Diff 标签页实际展示的内容保持一致。
+
+### 用户可见更新
+- **上传后的技能重新有了删除按钮** —— 把技能从全局工作区上传到技能仓库后，卡片以前会变得没有任何操作按钮：技能虽已同步却处于「未托管」状态，既没有删除键也没有重新上传键。现在新上传的技能会被注册为受管目标；同时新增一次性的启动修复，把此前因旧逻辑而卡死的技能的按钮也补回来。
+- **更新徽标与 Diff 现在一致了** —— 「有可用更新」徽标是对整个技能目录做哈希，而 Diff 标签页以前只比较主文件 `SKILL.md`，因此 `references/`、`scripts/` 里的改动、文件增删、或可执行位变化都会点亮更新提示却显示空 diff。现在 Diff 标签页会按文件展示整个技能目录的改动，徽标和 diff 始终对得上。
+
+### 开发者与治理更新
+- 把本地 agent 技能上传到中心时，改为复用常规的 `sync_single_skill_to_tool` 路径，使被采纳的技能成为与其他受管技能一致的受管目标；若目标注册失败，则回滚刚插入的技能记录。
+- 新增启动修复 `backfill_stranded_agent_targets`：扫描每个已安装且启用的 agent，找出 `source_ref` 指向 agent 技能目录、却没有对应 target 的中心技能。它严格按 `source_ref` 匹配（绝不按内容哈希，以免误认领相似技能），且只修复工作区判定为 `in_sync` 的技能（因为同步会用中央副本重写 agent 侧产物）。该过程幂等，并在所有技能都已有 target 后通过廉价预检直接短路。
+- 抽出统一的文件枚举辅助函数（`content_hash::list_content_files`）供哈希和 diff 共用，确保两者范围永不漂移；新增 `get_skill_source_diff` 命令，返回按文件分项的差异（新增 / 删除 / 修改；文本 / 二进制 / 过大 / 仅权限变化）；Diff 标签页按每个改动文件渲染 `SkillSourceDiffViewer`，并在打开时懒加载。
+- 在 README 中记录 macOS 15 Gatekeeper「无法验证此 App 不含恶意软件」对话框，附截图与照常打开 App 的步骤。
+- CI：跳过 rust-cache 的保存步骤，避免 Windows 发布构建出现误报失败。
+## [1.22.3] - 2026-05-30
+
+### 发布概览
+- 一个小修复版本：当某个项目关联了很多 agent 时，技能详情页里该项目的 agent 按钮也能正常显示。
+
+### 用户可见更新
+- **agent 按钮不再溢出卡片** —— 在技能详情页中，关联了很多 agent 的项目以前会把各 agent 的「添加/已安装」按钮挤出卡片边缘，导致被裁切看不全。现在这些按钮独占项目名下方的一行并自动换行，项目名和每个 agent 按钮都能完整显示（#188、#189）。
+
+### 开发者与治理更新
+- 将 `SkillProjectsSection` 中的项目行从单行横向 flex 改为两行堆叠布局（项目名 + 可换行的按钮行），去掉了导致 `flex-wrap` 失效的 `shrink-0`，把按钮左对齐到项目名下方，并清理了按钮 map 块残留的缩进。
+## [1.22.2] - 2026-05-28
+
+### 发布概览
+- 一次维护性发布：修复启动崩溃，并让技能重新在 Codex CLI 中可见。
+
+### 用户可见更新
+- **Codex 技能重新可见** —— 技能现在部署到 `~/.codex/skills/`，也就是 Codex CLI 实际读取用户级技能的位置。此前版本写到了 `~/.agents/skills/`，导致已安装的技能在 Codex 中根本不显示；旧路径保留为发现回退，已有安装仍会出现在 Codex 标签页（#182）。
+- **不再因失效预设而启动崩溃** —— 修复了一个外键 panic：当某个预设仍引用已被删除的技能时，应用可能在启动时崩溃。现在重建索引时会跳过（并记录）这些失效成员关系，而不是中断启动（#170）。
+
+### 开发者与治理更新
+- 同步日志更安静也更有用：去掉了多余的 `package-lock` peer 标记噪声，并在跳过失效预设成员关系时给出告警，同时新增覆盖「成员关系指向不存在的技能或预设」的回归测试。
+- 重构了两个 CHANGELOG 文件和 release notes 模板，统一为三段面向受众的结构（发布概览 / 用户可见更新 / 开发者与治理更新），取代旧的 Added/Changed/Fixed/Removed 划分。
+- release notes 现在会自动注入元信息 —— 发布日期、上一个 tag→当前 tag 的对比链接、以及校验状态区块 —— 并通过 awk 过滤掉空段，避免半填写的条目泄漏占位标题。
+
+## [1.22.1] - 2026-05-22
+
+### 发布概览
+- 这版主要清理了让用户困惑的两个状态指示元素，让技能库卡片和设置页 Agent 开关一眼可读。
+
+### 用户可见更新
+- **技能库卡片状态指示** —— 移除每张 Skill 卡片左上角的小圆圈。该圆圈表达的「至少已同步到某个 Agent」与左侧绿色竖边表达的「属于当前 Preset」混在一起，容易让用户误解；每个 Agent 的同步状态仍可在卡片右下角的 Agent 图标处看到。
+- **设置页 Agent 开关更显眼** —— 每个 Agent 旁的小图标已替换为 macOS 风格的开关（绿色 = 已启用，灰色 = 已禁用）。此前的图标看起来像一个状态标识，导致用户不知道可以点击它来启用或禁用 Agent。
+
+## [1.22.0] - 2026-05-21
+
+### 用户可见更新
+- **Skill 自动更新** —— 新增 **设置 → Skill 自动更新** 面板。可设置后台检查频率（每小时 / 每 6 小时 / 每天），让应用长时间开启时「可更新」徽标保持最新；并可开启 **自动应用更新**，检测到上游更新后自动拉取并更新，无需手动点击 —— 默认关闭，关闭时仅在技能库标记可更新。同时移除了设置页中冗余的「立即检查」按钮（技能库工具栏已有「检查全部」）。
+- **龙虾 Agent** 在侧边栏中独立成组，与编程类 Agent 分开显示。
+- 更新检查进行时，从托盘菜单应用 Preset 不再被阻塞。
+- **Preset 作为策展标签** —— 在 Preset 中添加或移除 Skill，不再立即改变实际部署到各 Agent 的内容；部署只在你显式「应用 Preset」时发生。
+
+### 开发者与治理更新
+- 重构 Preset 模型为「策展标签」语义：成员编辑与磁盘同步解耦，新增批量应用模式与工作区范围的托盘应用路径。
+- 后台自动更新调度器改为每 15 分钟轮询，以便及时触发最短的「每小时」检查并快速响应设置变更。
+- 托盘的 Preset 应用与更新检查改用各自独立的锁，两个操作不再互相阻塞。
+
+## [1.21.0] - 2026-05-18
+
+### 新增
+- **「添加 Skills」弹层** —— 任意工作区点击 **+ 添加 Skills** 即可打开统一的挑选弹层：搜索中央库，用始终可见的 Agent 标签切换目标（带一键全选 / 清空），一次提交批量添加多个 Skills。
+- **「未标签」过滤项** —— Library 标签筛选条新增 **未标签** 选项，可快速定位漏打标签的 Skills。
+- **从卡片直接删除** —— 在 **全局工作区** 中，仅存在于某个 Agent 目录、未关联中央库的 Skills 可直接在卡片上删除；**项目工作区** 中卡片上的删除按钮改为始终可见，不再仅悬停显示。
+- **活动日志与「导出日志」打包** —— 应用现在会本地记录安装 / 移除 / 更新 / 同步操作，**设置 → 导出日志** 会将这些活动连同最近日志文件一起打包为单个 zip，方便提交 Issue 时附上。
+- **启动时序诊断日志**，用于排查 Windows 启动慢的问题（#153）。
+
+### 变更
+- **Dashboard 改为面向整个技能库** —— Hero 区移除「当前 Preset」框架，改为显示技能库总数、同步覆盖率和实际已启用的 Agent 数量；近期动态也改为基于全部受管 Skills。
+- **Copy 模式同步更快** —— 当源文件哈希未变时跳过逐文件重写，大型技能库（尤其是 Windows 路径）重新同步明显更快（#153）。
+
+### 修复
+- **全局工作区切换 Agent 偶发卡在加载状态** —— 清理时正确重置「已加载 Agent」引用，切换时始终重新拉取。
+- **项目工作区调整目标 Agent 后 Skill 开关有时表现异常**，现已修复。
+
+## [1.20.0] - 2026-05-18
+
+### 新增
+- **`skills-manager-cli` 写命令** —— CLI 现在可以让 Agent 完整管理 skills：`install`（本地路径 / git URL / `owner/repo[@skill]` 简写）、`update`、`check`、`remove`、`sync`、`search`（skills.sh 市场，无需 API Key）、`adopt`（把 Agent 目录里已存在的 skill 收编进中央库）、`tag add/remove/list`。所有命令支持 `--json`；`remove` / `sync` / `adopt` 支持 `--dry-run`；`remove` 必须显式带 `--yes`。
+- **`presets add-skill` / `remove-skill` CLI 命令** —— 在命令行管理 preset 包含哪些 skill。
+- **`presets deactivate` CLI 命令**（别名 `close` / `stop` / `off` / `disable`）—— 关闭一个 preset 并撤销其同步目标。如果关闭的是当前激活 preset，会自动应用替代 preset；如果不是，会重新同步当前激活 preset，确保两边共用的 skill 仍然在 Agent 目录里。
+- **`manage-skills` skill**（`assets/manage-skills/SKILL.md`）—— 放入 `~/.claude/skills/` 后，Claude Code（及其它 Agent）会优先用 `skills-manager-cli`，而不是直接往某一个 Agent 目录里装 skill。
+- **应用内 Cmd/Ctrl+R** —— 一键刷新 skills / presets / Agent 状态，不需要重启（在输入框内输入时不会触发）。
+
+### 变更
+- **用户可见的 scenario 术语统一改为 preset** —— Tauri 命令（如 `apply_preset_to_default`）、CLI 子命令（`skills-manager-cli presets ...`）、CLI JSON 字段（`preset_id` / `preset_name`）、前端类型和 i18n key 现在都使用 `preset`。CLI 会保留 `scenarios`、`--scenario`、`--sync-scenario` 作为隐藏兼容别名一个版本。内部 Rust 类型、SQLite schema 和 Git Backup metadata 仍保留 `scenario` 以保证兼容。
+- **启用 / 禁用 skill 现在通过 preset 成员管理** —— 使用 `presets add-skill` / `presets remove-skill` 来决定哪些 skill 会被同步到 Agent。本版本起，旧的 `enabled` 标志不再参与同步判定。
+- **侧栏选中的 preset 不再被外部切换强制带走** —— 当 CLI 或托盘菜单切换激活 preset 时，仅当你正在浏览的就是上一个激活 preset，侧栏才会跟着走；如果你正在看另一个 preset，那个选择会保留下来。
+
+### 弃用
+- **`skills enable` / `skills disable` CLI** —— 两个命令现在都是 no-op，只打印弃用提示。请改用 `presets add-skill` / `presets remove-skill`。
+
+### 修复
+- **`presets close <非当前 preset>` 不再破坏当前激活 preset 的同步** —— 此前关闭一个非激活 preset 会把它和激活 preset 共用的 skill 的同步目标一起删掉；现在会在删完之后重新同步激活 preset，把共用部分恢复回来。
+- **`skills disable` 不会再偷偷把 skill 重新启用** —— 弃用前的 `disable` 实现会把旧的 `enabled` 标志翻回 `true`，与用户意图正好相反。现在它不再修改这个字段。
+
+### 移除
+- **SkillsMP AI 搜索** —— 移除第三方 `skillsmp.com` 集成（设置里的 API Key、安装页面的 "AI Search" 开关、`search_skillsmp` Tauri 命令）。免费的 skills.sh 市场和关键词搜索仍然保留。SkillsMP 没有被任何主流 Agent 生态采用，引入了付费第三方依赖且没有独特价值。
+
+## [1.19.3] - 2026-05-17
+
+### 新增
+- **「报告问题」按钮（设置 → 关于）** —— 一键复制应用版本、系统、已启用 Agent、界面语言和最近日志摘要到剪贴板，并打开预填好的 GitHub issue 模板，粘贴即可提交。
+- **「导出日志」按钮（设置 → 关于）** —— 把最近日志（路径、Token、邮箱等已脱敏）打包成 zip 保存到下载文件夹，并在文件管理器中高亮，方便拖到 issue 附件区。
+- **崩溃后下次启动顶部红色提示** —— 上一次运行如果异常退出，设置 → 关于 顶部会出现红色横幅和一键报告按钮，避免崩溃被忽略。
+- **GitHub issue 模板** —— bug 反馈与功能请求新增轻量中英双语模板，引导你使用上述按钮。
+
+### 变更
+- **正式版本现在会写本地日志**（Info 级别，5MB × 3 自动轮转）。导出或复制前会对家目录路径、Git 凭证、Token、邮箱等敏感信息脱敏；重复噪音行会折叠，关键事件更显眼。
+
+### 修复
+- **修复 git fetch 自激循环导致 CPU 持续 100%+ 甚至窗口卡死的问题** —— 一个「刷新→fetch→文件监听→再刷新」的循环已被切断；在部分 macOS 用户上还表现为 Skill 预览黑屏、只能 `⌘Q` 强退（#144、#69、#151、#150）。
+- **Windows / Linux 上托盘图标不再不可见** —— 原本的纯白托盘图标在 Windows 浅色任务栏上完全看不到；非 macOS 平台现在使用彩色变体，macOS 仍用模板风格白色图标（#154、#149）。
+
+
+
+### 修复
+- **Codex 技能改用官方路径 `~/.agents/skills`** —— Codex 按官方文档只从 `~/.agents/skills` 读取用户级技能，但 skills-manager 之前部署到 `~/.codex/skills`（codex 根本不读）且不扫 `~/.agents/skills`。现在部署和发现都改对，老的 `~/.codex/skills` 位置仍能扫到（兼容已存在的同步内容）（#143、#147）。
+- **GitHub Copilot 也扫描 `~/.agents/skills`** —— 在原有的 `~/.copilot/skills` 之外（#147）。
+- **本地安装失败显示真实错误信息** —— toast 不再出现 `[object Object]`，会显示实际错误内容（#101）。
+- **改了 SKILL.md 后中央列表的描述会自动刷新** —— 外部编辑 `SKILL.md` 不再需要重新导入才能看到新 description（#92）。
+- **安装/导入成功后不再误弹「失败」toast** —— 之前 install 之后的刷新（后台扫描、状态刷新）出错会被当成 install 失败；现在 install 与 refresh 分两阶段，refresh 失败仅记录日志，不污染 UI（#92）。
+- **重启前连续改两次中央仓库目录不再丢数据** —— 跨多次未重启的路径切换都能正确追溯原始数据位置（#92）。
+- **多变体技能安装会优先选通用版本** —— 当仓库提供多个 agent-specific 变体（`.cursor/skills/<id>`、`.claude/skills/<id>` 等）时，安装器现在稳定选择 `.agents/skills/<id>`，不会再随机命中（#103）。
+
+## [1.19.1] - 2026-05-15
+
+### 修复
+- **macOS 首次打开提示「应用已损坏」** — CI 构建的 release 包现在会做 ad-hoc 签名，下载 `.dmg` 后不再触发 Gatekeeper 的「已损坏」警告，无需手动执行 `xattr -cr`（#138）。
+- **老版本 macOS 打开技能详情时黑屏** — 技能详情侧边面板改用显式 stacking，修复 Monterey / 旧版 WKWebView 上面板渲染为黑色遮罩的回归问题（#69, #144）。
+- **从嵌套分类目录导入 git 技能** — git 技能导入现在会递归扫描嵌套分类目录，而不是只看顶层文件夹，便于按子分类组织的技能仓库正确导入（#121）。 
+## [1.19.0] - 2026-05-13
+
+### 新增
+- **Global Workspace 显示 Agent 本地 Skills**：每个 Agent 的页面现在会列出其全局目录里的所有 Skills，包括不是通过 Skills Manager 安装的。可按 Agent 把仅存在于本地的 Skill 上传到中央库、把库里的更新拉取到本地副本，或移除已纳管的 Skill；列表支持搜索和标签筛选。
+
+### 变更
+- **在卡片上直接安装 Skill**：每张 Skill 卡片现在会为每个已启用 Agent 显示一个图标角标（取代原来的两字母标签）。点击角标即可直接在卡片上为该 Agent 安装或移除这个 Skill，操作时角标会实时反映同步状态并显示加载动画。
+- **可自定义 Agent 顺序**：设置页支持在每个分组（主流 / 更多 / 自定义）内拖拽调整 Agent 顺序，这个顺序会应用到所有出现 Agent 的地方 —— 卡片角标、工作区列表、开关等。
+- **统一 Skill 卡片点击行为**：在技能库、Global Workspace 和项目工作区中，点击卡片任意位置都会打开详情面板；卡片上的操作按钮不再同时触发卡片点击。
+- **帮助弹窗**：新增「全局工作区」一项，并更新了「技能库」和「设置」两项的说明，覆盖新的 Agent 图标角标和 Agent 排序。
+
+### 修复
+- **OpenCode 项目 Skills 路径**：OpenCode 的项目级 Skills 现在会安装到 `<project>/.opencode/skills/`（OpenCode 实际读取的位置），而不是之前的 `<project>/.config/opencode/skills/`。
+- **打开 Global Workspace 的 Agent 页面不再重复刷新多次**：Agent 本地 Skills 列表每个 Agent 只加载一次，且上一个 Agent 残留的慢请求不会再覆盖当前页面的数据。
+- **CLI 加固**：设置 `--json` 时 `skills-manager-cli` 现在会返回 JSON 错误信封（包括参数解析错误），拒绝克隆到非空且非 git 的目录，设置 5 秒的 SQLite busy timeout 以避免与桌面应用同时使用时立即失败，并在 Windows 上正确处理 `PATH`。
+
+## [1.18.0] - 2026-05-09
+
+### 变更
+- **场景更名为 Preset**：应用内的“场景 / Scenario”已统一更名为 Preset，覆盖界面标签、侧边栏、设置、帮助和多语言文案。已有场景会以 Preset 形式继续使用，不需要迁移数据。
+- **Preset bar 取代“应用 Preset”弹窗**：Preset 现在以内联标签形式显示在 Global Workspace 和 Project Workspace 的搜索/标签筛选下方。点击标签即可为当前 Agent 范围启用或移除该 Preset 的全部 Skills；已启用会显示 ✓，部分安装会显示已安装/总数。
+- **Global Workspace 重设计**：每个 Agent 都有独立页面，可从侧边栏进入；固定的 **全部 Agents** 入口可一次管理所有已安装 Agent。每个 Agent 页面都支持标签筛选、多选和批量移除。
+- **侧边栏改进**：Preset 和项目工作区分组支持折叠；Global Workspace 中的 Agent 支持拖拽排序。
+- **新增 Agent 图标**：内置 Agent 现在会在设置、Global Workspace、项目弹窗和 Agent 开关中显示对应图标，多 Agent 列表更容易识别。
+- **更多 Preset 图标**：Preset 图标选择器新增 Agents、CLI、数据、分析、研究、安全、自动化、基础设施、实验等更多选项。
+
+## [1.17.0] - 2026-05-07
+
+### 新增
+- 新增面向 agent 的命令行工具 `skills-manager-cli`，无需打开桌面应用即可操作 skills 仓库 —— 列出/查看/导出技能、预览/应用 scenario、执行 git 备份命令。支持 `--json` 输出和 `--skills-root` 直接指向任意已克隆的 skills 目录。可通过 `npm run cli:install` 安装到 PATH。
+
+### 修复
+- Git 备份：Windows 下克隆远端 skills 仓库不再因仓库锁阻塞而失败 —— 锁文件已移到 skills 目录之外，克隆目标可以保持空目录。
+- CLI：`--skills-root` 不再把 `skills-manager.db` 等管理状态写到 skills 目录的父级，每个外部目录的状态现在统一放在 `~/.skills-manager/external/` 下，按 skills 根目录的规范化路径分目录隔离。
+
 ## [1.16.1] - 2026-05-01
 
 ### 变更

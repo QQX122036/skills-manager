@@ -98,13 +98,10 @@ pub async fn import_existing_skill(
 
             let result = installer::install_from_local(&path, Some(&resolved_name))?;
 
-            if let Some(existing) =
-                store.get_skill_by_central_path(&result.central_path.to_string_lossy())?
+            if store
+                .get_skill_by_central_path(&result.central_path.to_string_lossy())?
+                .is_some()
             {
-                if let Ok(Some(scenario_id)) = store.get_active_scenario_id() {
-                    store.add_skill_to_scenario(&scenario_id, &existing.id)?;
-                    sync_metadata::write_all_from_db_unlocked(&store)?;
-                }
                 return Ok(());
             }
 
@@ -135,10 +132,6 @@ pub async fn import_existing_skill(
 
             store.insert_skill(&record)?;
 
-            // Auto-add to active scenario
-            if let Ok(Some(scenario_id)) = store.get_active_scenario_id() {
-                store.add_skill_to_scenario(&scenario_id, &id)?;
-            }
             sync_metadata::write_all_from_db_unlocked(&store)
         })
         .map_err(AppError::io)?;
@@ -156,7 +149,6 @@ pub async fn import_all_discovered(store: State<'_, Arc<SkillStore>>) -> Result<
             let discovered = store.get_all_discovered()?;
             let groups = scanner::group_discovered(&discovered);
 
-            let active_scenario = store.get_active_scenario_id().ok().flatten();
             let mut changed = false;
 
             for group in groups {
@@ -167,13 +159,10 @@ pub async fn import_all_discovered(store: State<'_, Arc<SkillStore>>) -> Result<
                     let path = PathBuf::from(&first.found_path);
 
                     if let Ok(result) = installer::install_from_local(&path, Some(&group.name)) {
-                        if let Some(existing) = store
+                        if store
                             .get_skill_by_central_path(&result.central_path.to_string_lossy())?
+                            .is_some()
                         {
-                            if let Some(ref scenario_id) = active_scenario {
-                                store.add_skill_to_scenario(scenario_id, &existing.id)?;
-                                changed = true;
-                            }
                             continue;
                         }
 
@@ -202,11 +191,6 @@ pub async fn import_all_discovered(store: State<'_, Arc<SkillStore>>) -> Result<
                         };
                         store.insert_skill(&record)?;
                         changed = true;
-
-                        if let Some(ref scenario_id) = active_scenario {
-                            store.add_skill_to_scenario(scenario_id, &id)?;
-                            changed = true;
-                        }
                     }
                 }
             }

@@ -4,10 +4,11 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use super::audit_log::{AuditDraft, AuditEntry, MAX_ENTRIES as AUDIT_MAX_ENTRIES};
 use super::crypto;
 
 /// Settings keys whose values are encrypted at rest with AES-256-GCM.
-const SENSITIVE_KEYS: &[&str] = &["proxy_url", "git_backup_remote_url", "skillsmp_api_key"];
+const SENSITIVE_KEYS: &[&str] = &["proxy_url", "git_backup_remote_url"];
 
 pub struct SkillStore {
     conn: Mutex<Connection>,
@@ -47,6 +48,11 @@ pub struct SkillTargetRecord {
     pub status: String,
     pub synced_at: Option<i64>,
     pub last_error: Option<String>,
+    /// SHA-256 of the central skill source at the time of the last
+    /// successful sync. Compared against the current `skills.content_hash`
+    /// to skip redundant Copy-mode resyncs (issue #153). `None` for rows
+    /// written before this column existed, or when the source had no hash.
+    pub source_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +103,10 @@ pub struct ScenarioSkillToolToggleRecord {
 impl SkillStore {
     pub fn new(db_path: &PathBuf) -> Result<Self> {
         let conn = Connection::open(db_path)?;
+        // busy_timeout makes concurrent CLI + GUI writers wait briefly instead
+        // of failing immediately with SQLITE_BUSY. 5s is generous for any
+        // realistic write contention here.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
 
         super::migrations::run_migrations(&conn)?;
@@ -308,6 +318,16 @@ impl SkillStore {
         Ok(())
     }
 
+    pub fn update_skill_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "UPDATE skills SET enabled = ?1, updated_at = ?2 WHERE id = ?3",
+            params![enabled, now, id],
+        )?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_skill_after_install(
         &self,
@@ -404,8 +424,8 @@ impl SkillStore {
     pub fn insert_target(&self, target: &SkillTargetRecord) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO skill_targets (id, skill_id, tool, target_path, mode, status, synced_at, last_error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO skill_targets (id, skill_id, tool, target_path, mode, status, synced_at, last_error, source_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 target.id,
                 target.skill_id,
@@ -415,6 +435,7 @@ impl SkillStore {
                 target.status,
                 target.synced_at,
                 target.last_error,
+                target.source_hash,
             ],
         )?;
         Ok(())
@@ -423,7 +444,7 @@ impl SkillStore {
     pub fn get_targets_for_skill(&self, skill_id: &str) -> Result<Vec<SkillTargetRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, skill_id, tool, target_path, mode, status, synced_at, last_error FROM skill_targets WHERE skill_id = ?1",
+            "SELECT id, skill_id, tool, target_path, mode, status, synced_at, last_error, source_hash FROM skill_targets WHERE skill_id = ?1",
         )?;
         let rows = stmt.query_map(params![skill_id], |row| {
             Ok(SkillTargetRecord {
@@ -435,6 +456,7 @@ impl SkillStore {
                 status: row.get(5)?,
                 synced_at: row.get(6)?,
                 last_error: row.get(7)?,
+                source_hash: row.get(8)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -443,7 +465,7 @@ impl SkillStore {
     pub fn get_all_targets(&self) -> Result<Vec<SkillTargetRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, skill_id, tool, target_path, mode, status, synced_at, last_error FROM skill_targets",
+            "SELECT id, skill_id, tool, target_path, mode, status, synced_at, last_error, source_hash FROM skill_targets",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(SkillTargetRecord {
@@ -455,6 +477,7 @@ impl SkillStore {
                 status: row.get(5)?,
                 synced_at: row.get(6)?,
                 last_error: row.get(7)?,
+                source_hash: row.get(8)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -934,8 +957,34 @@ impl SkillStore {
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM scenario_skill_tools", [])?;
         tx.execute("DELETE FROM scenario_skills", [])?;
+
+        // OR IGNORE / OR REPLACE don't suppress FK violations in SQLite, so we
+        // must skip memberships that reference skills or scenarios no longer in the DB.
+        let valid_skill_ids: std::collections::HashSet<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM skills")?;
+            let ids: rusqlite::Result<std::collections::HashSet<String>> =
+                stmt.query_map([], |row| row.get::<_, String>(0))?.collect();
+            ids?
+        };
+        let valid_scenario_ids: std::collections::HashSet<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM scenarios")?;
+            let ids: rusqlite::Result<std::collections::HashSet<String>> =
+                stmt.query_map([], |row| row.get::<_, String>(0))?.collect();
+            ids?
+        };
+
         let now = chrono::Utc::now().timestamp_millis();
         for member in memberships {
+            if !valid_skill_ids.contains(&member.skill_id)
+                || !valid_scenario_ids.contains(&member.scenario_id)
+            {
+                log::warn!(
+                    "Skipping stale scenario membership (scenario_id={}, skill_id={}): referenced skill or scenario no longer exists",
+                    member.scenario_id,
+                    member.skill_id
+                );
+                continue;
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO scenario_skills (scenario_id, skill_id, added_at, sort_order)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -1151,6 +1200,205 @@ impl SkillStore {
             map.entry(row.0).or_default().push(row.1);
         }
         Ok(map)
+    }
+
+    // ── Audit log ──
+
+    /// Append an audit entry. Best-effort: errors are swallowed so callers
+    /// never have to wrap or propagate them. Auto-prunes when the table
+    /// grows beyond AUDIT_MAX_ENTRIES.
+    pub fn log_audit(&self, draft: AuditDraft) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let insert = conn.execute(
+            "INSERT INTO audit_log (ts, action, skill_id, skill_name, tool, success, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                ts,
+                draft.action,
+                draft.skill_id,
+                draft.skill_name,
+                draft.tool,
+                draft.success as i32,
+                draft.detail,
+            ],
+        );
+        if insert.is_err() {
+            return;
+        }
+        // Prune to MAX_ENTRIES newest. Cheap when under the cap (DELETE matches 0 rows).
+        let _ = conn.execute(
+            "DELETE FROM audit_log WHERE id IN (
+                 SELECT id FROM audit_log ORDER BY id DESC LIMIT -1 OFFSET ?1
+             )",
+            params![AUDIT_MAX_ENTRIES],
+        );
+    }
+
+    /// Read the most recent audit entries (newest first). When `limit` is
+    /// `None`, returns everything.
+    pub fn list_audit(&self, limit: Option<i64>) -> Result<Vec<AuditEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if limit.is_some() {
+            "SELECT id, ts, action, skill_id, skill_name, tool, success, detail
+             FROM audit_log ORDER BY id DESC LIMIT ?1"
+        } else {
+            "SELECT id, ts, action, skill_id, skill_name, tool, success, detail
+             FROM audit_log ORDER BY id DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<AuditEntry> {
+            Ok(AuditEntry {
+                id: row.get(0)?,
+                ts: row.get(1)?,
+                action: row.get(2)?,
+                skill_id: row.get(3)?,
+                skill_name: row.get(4)?,
+                tool: row.get(5)?,
+                success: row.get::<_, i32>(6)? != 0,
+                detail: row.get(7)?,
+            })
+        };
+        let rows = if let Some(n) = limit {
+            stmt.query_map(params![n], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map([], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod audit_log_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn log_audit_appends_and_lists_newest_first() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
+
+        store.log_audit(AuditDraft::new("install").skill("id1", "first").ok());
+        store.log_audit(AuditDraft::new("install").skill("id2", "second").ok());
+        store.log_audit(
+            AuditDraft::new("remove")
+                .skill("id1", "first")
+                .fail("missing"),
+        );
+
+        let entries = store.list_audit(None).unwrap();
+        assert_eq!(entries.len(), 3);
+        // Newest first
+        assert_eq!(entries[0].action, "remove");
+        assert!(!entries[0].success);
+        assert_eq!(entries[0].detail.as_deref(), Some("missing"));
+        assert_eq!(entries[2].action, "install");
+        assert_eq!(entries[2].skill_name.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn log_audit_respects_limit() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
+        for i in 0..5 {
+            store.log_audit(AuditDraft::new("sync").detail(format!("{i}")).ok());
+        }
+        let entries = store.list_audit(Some(2)).unwrap();
+        assert_eq!(entries.len(), 2);
+        // Newest first — latest detail is "4".
+        assert_eq!(entries[0].detail.as_deref(), Some("4"));
+    }
+}
+
+#[cfg(test)]
+mod scenario_membership_tests {
+    use super::*;
+    use crate::core::sync_metadata::ScenarioSkillMetaFile;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    fn sample_skill(id: &str) -> SkillRecord {
+        SkillRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            source_type: "import".to_string(),
+            source_ref: None,
+            source_ref_resolved: None,
+            source_subpath: None,
+            source_branch: None,
+            source_revision: None,
+            remote_revision: None,
+            central_path: format!("/tmp/{id}"),
+            content_hash: None,
+            enabled: true,
+            created_at: 1,
+            updated_at: 1,
+            status: "ok".to_string(),
+            update_status: "local_only".to_string(),
+            last_checked_at: None,
+            last_check_error: None,
+        }
+    }
+
+    fn membership(scenario_id: &str, skill_id: &str) -> ScenarioSkillMetaFile {
+        let mut tools = BTreeMap::new();
+        tools.insert("ToolA".to_string(), true);
+        ScenarioSkillMetaFile {
+            schema_version: 1,
+            scenario_id: scenario_id.to_string(),
+            skill_id: skill_id.to_string(),
+            sort_order: 0,
+            tools,
+        }
+    }
+
+    #[test]
+    fn skips_memberships_referencing_missing_skill_or_scenario() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
+
+        store.insert_scenario(&ScenarioRecord {
+            id: "s1".to_string(),
+            name: "S1".to_string(),
+            description: None,
+            icon: None,
+            sort_order: 0,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .unwrap();
+        store.upsert_skill(&sample_skill("k1")).unwrap();
+
+        let memberships = vec![
+            membership("s1", "k1"),       // valid
+            membership("s1", "ghost"),    // skill missing
+            membership("ghost-s", "k1"),  // scenario missing
+        ];
+
+        // Must not panic with a FOREIGN KEY constraint failure.
+        store
+            .replace_scenario_memberships_from_metadata(&memberships)
+            .unwrap();
+
+        assert_eq!(store.get_skill_ids_for_scenario("s1").unwrap(), vec!["k1"]);
+        assert_eq!(
+            store.get_enabled_tools_for_scenario_skill("s1", "k1").unwrap(),
+            vec!["ToolA"]
+        );
+        assert!(store
+            .get_enabled_tools_for_scenario_skill("ghost-s", "k1")
+            .unwrap()
+            .is_empty());
     }
 }
 

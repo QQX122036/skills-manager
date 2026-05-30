@@ -44,7 +44,7 @@ const MARKET_SEARCH_CACHE_MAX_ENTRIES = 150;
 
 export function InstallSkills() {
   const { t } = useTranslation();
-  const { refreshScenarios, refreshManagedSkills, managedSkills, openSkillDetailById } = useApp();
+  const { refreshPresets, refreshManagedSkills, managedSkills, openSkillDetailById } = useApp();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [activeTab, setActiveTab] = useState<"market" | "local" | "git">("market");
@@ -71,7 +71,7 @@ export function InstallSkills() {
   const [gitCancelKey, setGitCancelKey] = useState<string | null>(null);
   const [gitPreview, setGitPreview] = useState<GitPreviewResult | null>(null);
   const [gitPreviewRepoUrl, setGitPreviewRepoUrl] = useState<string | null>(null);
-  const [gitSelections, setGitSelections] = useState<{ dir_name: string; name: string; description: string | null; selected: boolean }[]>([]);
+  const [gitSelections, setGitSelections] = useState<{ rel_path: string; name: string; description: string | null; selected: boolean }[]>([]);
   const [gitConfirmLoading, setGitConfirmLoading] = useState(false);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
   const [scanLoading, setScanLoading] = useState(false);
@@ -80,7 +80,6 @@ export function InstallSkills() {
   const [importingAll, setImportingAll] = useState(false);
   const [renameEditing, setRenameEditing] = useState<Record<string, string>>({});
   const [aiSearch, setAiSearch] = useState(false);
-  const [skillsmpApiKey, setSkillsmpApiKey] = useState<string | null>(null);
   const [aiApiKey, setAiApiKey] = useState<string | null>(null);
   const marketListRef = useRef<HTMLDivElement | null>(null);
   const [sourceOverflowOpen, setSourceOverflowOpen] = useState(false);
@@ -186,7 +185,6 @@ export function InstallSkills() {
   }, [resetSourceOverflowState, sourceOverflowOpen]);
 
   useEffect(() => {
-    api.getSettings("skillsmp_api_key").then((v) => setSkillsmpApiKey(v || null));
     api.getSettings("ai_api_key").then((v) => setAiApiKey(v || null));
   }, []);
 
@@ -218,6 +216,26 @@ export function InstallSkills() {
     }
   }, [t]);
 
+  // Silent variant used after install/import. Never surfaces a toast or
+  // new error state — failure here must not mask the install success.
+  // Clears any stale localError on success so successful operations don't
+  // leave previous error banners behind.
+  const runScanSilent = useCallback(async () => {
+    try {
+      const result = await api.scanLocalSkills();
+      setScanResult(result);
+      setLocalError(null);
+    } catch (error: unknown) {
+      console.warn("silent scan failed:", error);
+    }
+  }, []);
+
+  const warnRejected = (results: PromiseSettledResult<unknown>[], label: string) => {
+    for (const r of results) {
+      if (r.status === "rejected") console.warn(`${label} failed:`, r.reason);
+    }
+  };
+
   useEffect(() => {
     if (activeTab !== "market") return;
 
@@ -228,7 +246,7 @@ export function InstallSkills() {
       marketSearchLimit > marketSkillsLengthRef.current;
 
     if (query.length > 0 && !loadingMore) {
-      const cacheKey = `${query.toLowerCase()}|${aiSearch ? "ai" : "kw"}|${marketSearchLimit}`;
+      const cacheKey = `${query.toLowerCase()}|${marketSearchLimit}`;
       const cached = marketSearchCacheRef.current.get(cacheKey);
       if (cached && Date.now() - cached.timestamp < MARKET_SEARCH_CACHE_TTL_MS) {
         setMarketSkills(cached.data);
@@ -319,40 +337,6 @@ export function InstallSkills() {
           setMarketLoading(false);
           setMarketLoadingMore(false);
         });
-    } else if (aiSearch && skillsmpApiKey) {
-      setDeepSearchResults([]);
-      setIsDeepSearch(false);
-      const request = api.searchSkillsmp(query, true, undefined, marketSearchLimit);
-      setAiThinking(null);
-
-      request
-        .then((result) => {
-          if (stale) return;
-          setAiThinking(null);
-          setMarketSkills(result);
-          const skills = result;
-          if (query.length > 0 && !loadingMore) {
-            const cacheKey = `${query.toLowerCase()}|ai|${marketSearchLimit}`;
-            marketSearchCacheRef.current.set(cacheKey, { timestamp: Date.now(), data: skills });
-            pruneMarketSearchCache();
-          }
-          if (!loadingMore) {
-            setMarketSourceFilter("all");
-          }
-        })
-        .catch((e) => {
-          if (stale) return;
-          console.error(e);
-          const message = getErrorMessage(e, t("common.error"));
-          setAiThinking(null);
-          setMarketError(message);
-          toast.error(message);
-        })
-        .finally(() => {
-          if (stale) return;
-          setMarketLoading(false);
-          setMarketLoadingMore(false);
-        });
     } else {
       setDeepSearchResults([]);
       setIsDeepSearch(false);
@@ -390,7 +374,7 @@ export function InstallSkills() {
     }
 
     return () => { stale = true; };
-  }, [activeTab, aiApiKey, aiSearch, debouncedMarketQuery, marketReloadKey, marketSearchLimit, marketTab, pruneMarketSearchCache, skillsmpApiKey, t]);
+  }, [activeTab, aiApiKey, aiSearch, debouncedMarketQuery, marketReloadKey, marketSearchLimit, marketTab, pruneMarketSearchCache, t]);
 
   useEffect(() => {
     if (activeTab === "local" && !scanResult && !scanLoading) {
@@ -403,20 +387,27 @@ export function InstallSkills() {
     const toastId = toast.loading(t("install.toast.installing", { name }));
     try {
       await api.installLocal(sourcePath);
-      await Promise.all([refreshScenarios(), refreshManagedSkills()]);
-      await runScan();
-      toast.success(t("install.toast.success", { name }), {
-        id: toastId,
-        action: {
-          label: t("install.toast.view"),
-          onClick: () => goToSkill(name),
-        },
-      });
     } catch (e) {
-      const message = (e as Error)?.toString?.() || t("common.error");
+      const message = getErrorMessage(e, t("common.error"));
       setLocalError(message);
       toast.error(message, { id: toastId });
+      return;
     }
+    // Install succeeded — post-install refresh is best-effort and must not
+    // surface as an install failure.
+    const results = await Promise.allSettled([
+      refreshPresets(),
+      refreshManagedSkills(),
+      runScanSilent(),
+    ]);
+    warnRejected(results, "post-install refresh");
+    toast.success(t("install.toast.success", { name }), {
+      id: toastId,
+      action: {
+        label: t("install.toast.view"),
+        onClick: () => goToSkill(name),
+      },
+    });
   };
 
   const handleLocalFolderInstall = async () => {
@@ -498,7 +489,7 @@ export function InstallSkills() {
         );
       }
 
-      await Promise.all([refreshScenarios(), refreshManagedSkills()]);
+      await Promise.all([refreshPresets(), refreshManagedSkills()]);
       runScan();
     } catch (error: unknown) {
       const message = getErrorMessage(error, t("common.error"));
@@ -534,7 +525,7 @@ export function InstallSkills() {
         }
       );
       await api.installFromSkillssh(skill.source, skill.skill_id);
-      await Promise.all([refreshScenarios(), refreshManagedSkills()]);
+      await Promise.all([refreshPresets(), refreshManagedSkills()]);
       toast.success(t("install.toast.success", { name: displayName }), {
         id: toastId,
         action: {
@@ -588,7 +579,7 @@ export function InstallSkills() {
       setGitPreview(preview);
       setGitPreviewRepoUrl(url);
       setGitSelections(preview.skills.map((s) => ({
-        dir_name: s.dir_name,
+        rel_path: s.rel_path,
         name: s.name,
         description: s.description,
         selected: true,
@@ -627,9 +618,9 @@ export function InstallSkills() {
       await api.confirmGitInstall(
         repoUrl,
         gitPreview.temp_dir,
-        selected.map((s) => ({ dir_name: s.dir_name, name: s.name }))
+        selected.map((s) => ({ rel_path: s.rel_path, name: s.name }))
       );
-      await Promise.all([refreshScenarios(), refreshManagedSkills()]);
+      await Promise.all([refreshPresets(), refreshManagedSkills()]);
       toast.success(t("install.toast.success", { name: selected.map((s) => s.name).join(", ") }));
       setGitUrl("");
       setGitPreview(null);
@@ -645,12 +636,19 @@ export function InstallSkills() {
   const handleImportDiscovered = async (sourcePath: string, name: string) => {
     setImportingPaths((prev) => new Set(prev).add(sourcePath));
     try {
-      await api.importExistingSkill(sourcePath, name);
+      try {
+        await api.importExistingSkill(sourcePath, name);
+      } catch (error: unknown) {
+        toast.error(getErrorMessage(error, t("common.error")));
+        return;
+      }
       toast.success(t("install.scan.importedOne", { name }));
-      await Promise.all([refreshScenarios(), refreshManagedSkills()]);
-      await runScan();
-    } catch (error: unknown) {
-      toast.error(getErrorMessage(error, t("common.error")));
+      const results = await Promise.allSettled([
+        refreshPresets(),
+        refreshManagedSkills(),
+        runScanSilent(),
+      ]);
+      warnRejected(results, "post-import refresh");
     } finally {
       setImportingPaths((prev) => {
         const next = new Set(prev);
@@ -663,12 +661,19 @@ export function InstallSkills() {
   const handleImportAllDiscovered = async () => {
     setImportingAll(true);
     try {
-      await api.importAllDiscovered();
+      try {
+        await api.importAllDiscovered();
+      } catch (error: unknown) {
+        toast.error(getErrorMessage(error, t("common.error")));
+        return;
+      }
       toast.success(t("install.scan.importedAll"));
-      await Promise.all([refreshScenarios(), refreshManagedSkills()]);
-      await runScan();
-    } catch (error: unknown) {
-      toast.error(getErrorMessage(error, t("common.error")));
+      const results = await Promise.allSettled([
+        refreshPresets(),
+        refreshManagedSkills(),
+        runScanSilent(),
+      ]);
+      warnRejected(results, "post-import refresh");
     } finally {
       setImportingAll(false);
     }
@@ -893,11 +898,11 @@ export function InstallSkills() {
                   </button>
                   <button
                     onClick={() => {
-                      if (aiApiKey || skillsmpApiKey) {
+                      if (aiApiKey) {
                         setAiSearch((v) => !v);
                       } else {
                         toast.info(
-                          t("install.aiSearchNoKey", { defaultValue: "Set your AI API key or SkillsMP API key in Settings to enable AI search" }),
+                          t("install.aiSearchNoKey", { defaultValue: "Set your AI API key in Settings to enable AI search" }),
                           {
                             action: {
                               label: t("common.goToSettings", { defaultValue: "Settings" }),
@@ -909,7 +914,7 @@ export function InstallSkills() {
                     }}
                     className={cn(
                       "shrink-0 h-10 rounded-lg border px-3 text-[13px] font-medium transition-colors",
-                      aiSearch && (aiApiKey || skillsmpApiKey)
+                      aiSearch && aiApiKey
                         ? "border-accent-border bg-accent-bg text-accent-light"
                         : "border-border-subtle bg-background text-muted hover:bg-surface-hover hover:text-secondary"
                     )}
@@ -2006,7 +2011,7 @@ export function InstallSkills() {
               <div className="max-h-64 space-y-2 overflow-y-auto scrollbar-hide pr-1">
                 {gitSelections.map((item, idx) => (
                   <div
-                    key={item.dir_name}
+                    key={item.rel_path}
                     className={cn(
                       "flex items-center gap-3 rounded-lg border px-3 py-2 transition-colors",
                       item.selected

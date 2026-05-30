@@ -59,6 +59,7 @@ pub fn read_project_skills(
             &config.key,
             &config.display_name,
             &mut skills,
+            true,
         );
         read_skills_from_dir(
             &disabled_dir,
@@ -66,6 +67,7 @@ pub fn read_project_skills(
             &config.key,
             &config.display_name,
             &mut skills,
+            true,
         );
     }
 
@@ -78,6 +80,7 @@ pub fn read_linked_workspace_skills(
     disabled_root: Option<&Path>,
     agent_key: &str,
     agent_display_name: &str,
+    recursive: bool,
 ) -> Vec<ProjectSkillInfo> {
     let mut skills = Vec::new();
     read_skills_from_dir(
@@ -86,6 +89,7 @@ pub fn read_linked_workspace_skills(
         agent_key,
         agent_display_name,
         &mut skills,
+        recursive,
     );
     if let Some(disabled_root) = disabled_root {
         read_skills_from_dir(
@@ -94,6 +98,7 @@ pub fn read_linked_workspace_skills(
             agent_key,
             agent_display_name,
             &mut skills,
+            recursive,
         );
     }
     skills.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -119,6 +124,7 @@ fn read_skills_from_dir(
     agent: &str,
     agent_display_name: &str,
     skills: &mut Vec<ProjectSkillInfo>,
+    recursive: bool,
 ) {
     if !dir.is_dir() {
         return;
@@ -135,6 +141,7 @@ fn read_skills_from_dir(
         agent_display_name,
         skills,
         &mut visited,
+        recursive,
     );
 }
 
@@ -146,6 +153,7 @@ fn read_skills_from_dir_recursive(
     agent_display_name: &str,
     skills: &mut Vec<ProjectSkillInfo>,
     visited: &mut std::collections::HashSet<PathBuf>,
+    recursive: bool,
 ) {
     let Ok(entries) = std::fs::read_dir(current) else {
         return;
@@ -200,7 +208,7 @@ fn read_skills_from_dir_recursive(
         // to prevent symlink cycles. Skill dirs (above) are leaf nodes and
         // are allowed to alias the same canonical target.
 
-        if should_skip_dir(root, &path) {
+        if !recursive || should_skip_dir(root, &path) {
             continue;
         }
 
@@ -219,6 +227,7 @@ fn read_skills_from_dir_recursive(
             agent_display_name,
             skills,
             visited,
+            recursive,
         );
     }
 }
@@ -401,11 +410,22 @@ mod tests {
 
         let top_level_skill = skills_root.join("understand");
         fs::create_dir_all(&top_level_skill).unwrap();
-        fs::write(top_level_skill.join("SKILL.md"), "---\nname: understand\n---\n").unwrap();
+        fs::write(
+            top_level_skill.join("SKILL.md"),
+            "---\nname: understand\n---\n",
+        )
+        .unwrap();
 
-        let hidden_skill = skills_root.join(".claude").join("skills").join("hidden-skill");
+        let hidden_skill = skills_root
+            .join(".claude")
+            .join("skills")
+            .join("hidden-skill");
         fs::create_dir_all(&hidden_skill).unwrap();
-        fs::write(hidden_skill.join("SKILL.md"), "---\nname: hidden-skill\n---\n").unwrap();
+        fs::write(
+            hidden_skill.join("SKILL.md"),
+            "---\nname: hidden-skill\n---\n",
+        )
+        .unwrap();
 
         let embedded_enabled = skills_root
             .join("understand-anything")
@@ -414,7 +434,11 @@ mod tests {
             .join("skills")
             .join("understand");
         fs::create_dir_all(&embedded_enabled).unwrap();
-        fs::write(embedded_enabled.join("SKILL.md"), "---\nname: understand\n---\n").unwrap();
+        fs::write(
+            embedded_enabled.join("SKILL.md"),
+            "---\nname: understand\n---\n",
+        )
+        .unwrap();
 
         let disabled_skill = disabled_root.join("understand-diff");
         fs::create_dir_all(&disabled_skill).unwrap();
@@ -442,12 +466,16 @@ mod tests {
             Some(&disabled_root),
             "linked",
             "Linked",
+            true,
         );
 
         let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
         assert_eq!(names, vec!["understand", "understand-diff"]);
         assert_eq!(
-            skills.iter().filter(|skill| skill.name == "understand").count(),
+            skills
+                .iter()
+                .filter(|skill| skill.name == "understand")
+                .count(),
             1
         );
         assert!(skills
@@ -456,5 +484,32 @@ mod tests {
         assert!(skills
             .iter()
             .any(|skill| skill.name == "understand-diff" && !skill.enabled));
+    }
+
+    #[test]
+    fn linked_workspace_flat_scan_ignores_nested_skills() {
+        let tmp = tempdir().unwrap();
+        let skills_root = tmp.path().join("skills");
+
+        let top_level_skill = skills_root.join("codex-tool");
+        fs::create_dir_all(&top_level_skill).unwrap();
+        fs::write(
+            top_level_skill.join("SKILL.md"),
+            "---\nname: codex-tool\n---\n",
+        )
+        .unwrap();
+
+        let nested_skill = skills_root.join("vendor").join("nested-tool");
+        fs::create_dir_all(&nested_skill).unwrap();
+        fs::write(
+            nested_skill.join("SKILL.md"),
+            "---\nname: nested-tool\n---\n",
+        )
+        .unwrap();
+
+        let skills = read_linked_workspace_skills(&skills_root, None, "codex", "Codex", false);
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "codex-tool");
     }
 }

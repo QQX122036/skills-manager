@@ -1,4 +1,6 @@
 pub mod ai_search_api;
+pub mod app_state;
+pub mod audit_log;
 pub mod central_repo;
 pub mod content_hash;
 pub mod crypto;
@@ -8,17 +10,21 @@ pub mod git_backup;
 pub mod git_fetcher;
 pub mod install_cancel;
 pub mod installer;
+pub mod log_sanitize;
 pub mod migrations;
+pub mod panic_log;
+pub mod path_guard;
 pub mod project_scanner;
 pub mod repo_lock;
 pub mod scanner;
+pub mod scenario_service;
+pub mod skill_auto_updater;
 pub mod skill_metadata;
 pub mod skill_store;
-pub mod skillsmp_api;
 pub mod skillssh_api;
 pub mod sync_engine;
 pub mod sync_metadata;
 pub mod test_ai_search;
+pub mod timing;
 pub mod tool_adapters;
-
-// Internal types for test_ai_search, not re-exported
+pub mod tool_service;

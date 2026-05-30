@@ -1,10 +1,13 @@
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::Serialize;
 use tauri::State;
 
 use crate::core::skill_store::{ProjectRecord, SkillRecord, SkillStore};
+use crate::core::timing::should_log_first_or_slow;
 use crate::core::{error::AppError, installer, project_scanner, sync_engine, tool_adapters};
 
 #[derive(Serialize, Default)]
@@ -50,19 +53,14 @@ pub struct ProjectAgentTargetDto {
 fn agent_skill_configs(store: &SkillStore) -> Vec<project_scanner::AgentSkillConfig> {
     let mut grouped: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for adapter in tool_adapters::all_tool_adapters(store) {
-        if adapter.relative_skills_dir.is_empty() {
+        let project_dir = adapter.project_relative_skills_dir().to_string();
+        if project_dir.is_empty() {
             continue;
         }
-        if let Some((_, agents)) = grouped
-            .iter_mut()
-            .find(|(dir, _)| *dir == adapter.relative_skills_dir)
-        {
+        if let Some((_, agents)) = grouped.iter_mut().find(|(dir, _)| *dir == project_dir) {
             agents.push((adapter.key, adapter.display_name));
         } else {
-            grouped.push((
-                adapter.relative_skills_dir,
-                vec![(adapter.key, adapter.display_name)],
-            ));
+            grouped.push((project_dir, vec![(adapter.key, adapter.display_name)]));
         }
     }
 
@@ -110,6 +108,7 @@ fn read_workspace_skills(
             rec.disabled_path.as_deref().map(Path::new),
             &linked_workspace_agent_key(rec),
             &linked_workspace_agent_name(rec),
+            true,
         );
     }
     project_scanner::read_project_skills(Path::new(&rec.path), configs)
@@ -134,9 +133,9 @@ fn resolve_agent_skills_roots(
     let adapter = tool_adapters::all_tool_adapters(store)
         .into_iter()
         .find(|adapter| adapter.key == agent)?;
-    let skills_root = Path::new(&rec.path).join(&adapter.relative_skills_dir);
-    let disabled_root =
-        Path::new(&rec.path).join(format!("{}-disabled", &adapter.relative_skills_dir));
+    let project_dir = adapter.project_relative_skills_dir();
+    let skills_root = Path::new(&rec.path).join(project_dir);
+    let disabled_root = Path::new(&rec.path).join(format!("{}-disabled", project_dir));
     Some((skills_root, Some(disabled_root)))
 }
 
@@ -214,7 +213,7 @@ fn project_to_dto(
     }
 }
 
-fn ensure_safe_skill_relative_path(skill_relative_path: &str) -> Result<(), AppError> {
+pub(crate) fn ensure_safe_skill_relative_path(skill_relative_path: &str) -> Result<(), AppError> {
     if skill_relative_path.trim().is_empty() {
         return Err(AppError::invalid_input("Invalid skill directory path"));
     }
@@ -231,7 +230,7 @@ fn ensure_safe_skill_relative_path(skill_relative_path: &str) -> Result<(), AppE
     Ok(())
 }
 
-fn ensure_dir_within_root(path: &Path, root: &Path) -> Result<(), AppError> {
+pub(crate) fn ensure_dir_within_root(path: &Path, root: &Path) -> Result<(), AppError> {
     // First check that the lexical path (before symlink resolution) is under root.
     // This ensures the link itself lives where expected.
     let abs_path = if path.is_absolute() {
@@ -386,7 +385,7 @@ fn ensure_distinct_linked_workspace_roots(
     Ok(())
 }
 
-fn slugify_skill_dir_name(name: &str) -> String {
+pub(crate) fn slugify_skill_dir_name(name: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in name.chars().flat_map(|c| c.to_lowercase()) {
@@ -407,7 +406,7 @@ fn slugify_skill_dir_name(name: &str) -> String {
     }
 }
 
-fn source_ref_matches_skill_path(
+pub(crate) fn source_ref_matches_skill_path(
     skill_path: &str,
     skill_canonical: Option<&PathBuf>,
     managed: &SkillRecord,
@@ -427,7 +426,7 @@ fn source_ref_matches_skill_path(
     source_canonical == *skill_canonical
 }
 
-fn find_best_center_match<'a>(
+pub(crate) fn find_best_center_match<'a>(
     skill: &project_scanner::ProjectSkillInfo,
     all_managed: &'a [SkillRecord],
 ) -> Option<&'a SkillRecord> {
@@ -453,7 +452,7 @@ fn find_best_center_match<'a>(
         .map(|(managed, _)| managed)
 }
 
-fn classify_sync_status(
+pub(crate) fn classify_sync_status(
     skill: &project_scanner::ProjectSkillInfo,
     managed: Option<&SkillRecord>,
 ) -> String {
@@ -494,17 +493,26 @@ fn classify_sync_status(
     }
 }
 
+static GET_PROJECTS_FIRST_CALL: AtomicBool = AtomicBool::new(true);
+
 #[tauri::command]
 pub async fn get_projects(store: State<'_, Arc<SkillStore>>) -> Result<Vec<ProjectDto>, AppError> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let start = Instant::now();
         let records = store.get_all_projects().map_err(AppError::db)?;
         let all_managed = store.get_all_skills().map_err(AppError::db)?;
         let configs = agent_skill_configs(&store);
-        Ok(records
+        let count = records.len();
+        let dtos: Vec<ProjectDto> = records
             .iter()
             .map(|r| project_to_dto(r, &all_managed, &configs))
-            .collect())
+            .collect();
+        let elapsed_ms = start.elapsed().as_millis();
+        if should_log_first_or_slow(&GET_PROJECTS_FIRST_CALL, elapsed_ms, 100) {
+            log::info!("get_projects: {count} projects in {elapsed_ms} ms");
+        }
+        Ok(dtos)
     })
     .await?
 }
@@ -867,7 +875,6 @@ pub async fn import_project_skill_to_center(
         let result =
             installer::install_from_local(&source_path, Some(&skill.name)).map_err(AppError::io)?;
 
-        let active = store.get_active_scenario_id().ok().flatten();
         let now = chrono::Utc::now().timestamp_millis();
         let id = uuid::Uuid::new_v4().to_string();
 
@@ -894,12 +901,6 @@ pub async fn import_project_skill_to_center(
         };
 
         store.insert_skill(&skill_record).map_err(AppError::db)?;
-
-        if let Some(scenario_id) = active.as_deref() {
-            store
-                .add_skill_to_scenario(scenario_id, &id)
-                .map_err(AppError::db)?;
-        }
 
         Ok(())
     })

@@ -1,15 +1,31 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-#[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
 
 const CONFIG_FILE_NAME: &str = "repo-config.json";
 
+static BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static SKILLS_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+/// Global mutex shared by every test that mutates the base-dir override via
+/// [`set_test_base_dir_override`]. The override is process-wide static state,
+/// so any two tests holding their own per-module locks can still race. Tests
+/// must take this guard before calling `set_test_base_dir_override` and keep
+/// it alive until they restore the previous value.
 #[cfg(test)]
-static TEST_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static TEST_BASE_DIR_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn test_base_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_BASE_DIR_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RepoPathConfig {
@@ -89,8 +105,7 @@ pub fn configured_base_dir() -> Option<PathBuf> {
 }
 
 pub fn base_dir() -> PathBuf {
-    #[cfg(test)]
-    if let Some(path) = TEST_BASE_DIR_OVERRIDE
+    if let Some(path) = BASE_DIR_OVERRIDE
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap()
@@ -102,16 +117,120 @@ pub fn base_dir() -> PathBuf {
     configured_base_dir().unwrap_or_else(default_base_dir)
 }
 
-#[cfg(test)]
-pub(crate) fn set_test_base_dir_override(path: Option<PathBuf>) {
-    *TEST_BASE_DIR_OVERRIDE
+pub fn set_runtime_base_dir_override(path: Option<PathBuf>) {
+    *BASE_DIR_OVERRIDE
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap() = path;
 }
 
+pub fn set_runtime_skills_dir_override(path: Option<PathBuf>) {
+    *SKILLS_DIR_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = path;
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_base_dir_override(path: Option<PathBuf>) {
+    set_runtime_base_dir_override(path);
+    set_runtime_skills_dir_override(None);
+}
+
 pub fn skills_dir() -> PathBuf {
+    if let Some(path) = SKILLS_DIR_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+    {
+        return path;
+    }
     base_dir().join("skills")
+}
+
+/// Derive a stable per-skills-root state directory under the user's default base.
+///
+/// CLI's `--skills-root` lets agents operate on an external skills checkout
+/// (e.g. a freshly cloned `my-skills`) without touching the app's default repo.
+/// The manager still needs a home for its DB, scenarios, cache, and logs — but
+/// putting that state inside the external checkout would pollute the user's
+/// repo, and putting it in the parent directory would silently litter wherever
+/// the user happened to clone. Instead, namespace the state under
+/// `<default-base>/external/<sanitized-name>-<short-hash>/`, keyed by the
+/// canonical path of the skills root so repeat invocations reuse the same DB.
+pub fn external_base_dir(skills_root: &Path) -> PathBuf {
+    // canonicalize() requires the path to exist. For not-yet-cloned targets we
+    // still want a stable namespace, so fall back to absolutizing + lexically
+    // normalizing the path. Without this, `./my-skills`, `my-skills`, and
+    // `a/../my-skills` would hash to different namespaces despite resolving
+    // to the same location.
+    let canonical = match skills_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            let absolute = if skills_root.is_absolute() {
+                skills_root.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(skills_root))
+                    .unwrap_or_else(|_| skills_root.to_path_buf())
+            };
+            lexically_normalize(&absolute)
+        }
+    };
+    let name = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("external");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let short_hash: String = digest.iter().take(5).map(|b| format!("{:02x}", b)).collect();
+    default_base_dir()
+        .join("external")
+        .join(format!("{}-{}", sanitize_dir_name(name), short_hash))
+}
+
+/// Lexically normalize `.` and `..` segments without touching the filesystem.
+/// `..` over a normal segment cancels it; `..` over a root or another `..`
+/// is preserved (so we don't pretend to escape the filesystem root).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {
+                    // can't go above root — drop the `..`
+                }
+                _ => out.push(comp),
+            },
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
+}
+
+fn sanitize_dir_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "external".to_string()
+    } else {
+        cleaned
+    }
 }
 
 pub fn scenarios_dir() -> PathBuf {
@@ -134,30 +253,36 @@ pub fn set_base_dir_override(path: Option<String>) -> Result<PathBuf> {
     let current = base_dir();
     let mut config = load_config();
 
-    match path {
-        Some(raw) => {
-            let next = normalize_path(&raw)?;
-            config.repo_path = Some(next.to_string_lossy().to_string());
-            config.pending_migration_from = if next != current {
-                Some(current.to_string_lossy().to_string())
-            } else {
-                None
-            };
-            save_config(&config)?;
-            Ok(next)
-        }
-        None => {
-            let next = default_base_dir();
-            config.repo_path = None;
-            config.pending_migration_from = if next != current {
-                Some(current.to_string_lossy().to_string())
-            } else {
-                None
-            };
-            save_config(&config)?;
-            Ok(next)
-        }
-    }
+    // The actual on-disk data location can differ from `current` when the user
+    // already changed the path once but hasn't restarted yet — `current` then
+    // reflects the unsatisfied future target stored in `repo_path`, while the
+    // data still sits at `pending_migration_from`. Track the true location so
+    // multiple changes before restart still migrate from the right source.
+    let data_location = match &config.pending_migration_from {
+        Some(src) => match normalize_path(src) {
+            Ok(path) if path.is_dir() => path,
+            _ => current.clone(),
+        },
+        None => current.clone(),
+    };
+
+    let (next, persist_repo_path) = match path {
+        Some(raw) => (normalize_path(&raw)?, true),
+        None => (default_base_dir(), false),
+    };
+
+    config.repo_path = if persist_repo_path {
+        Some(next.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    config.pending_migration_from = if next != data_location {
+        Some(data_location.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    save_config(&config)?;
+    Ok(next)
 }
 
 fn directory_has_entries(path: &Path) -> Result<bool> {
@@ -255,4 +380,85 @@ pub fn ensure_central_repo() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_base_dir_lives_under_default_base_external() {
+        let dir = external_base_dir(Path::new("/tmp/some/my-skills"));
+        let prefix = default_base_dir().join("external");
+        assert!(
+            dir.starts_with(&prefix),
+            "expected {} to start with {}",
+            dir.display(),
+            prefix.display()
+        );
+    }
+
+    #[test]
+    fn external_base_dir_is_stable_for_same_path() {
+        let a = external_base_dir(Path::new("/tmp/some/my-skills"));
+        let b = external_base_dir(Path::new("/tmp/some/my-skills"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn external_base_dir_differs_for_different_paths() {
+        let a = external_base_dir(Path::new("/tmp/one/my-skills"));
+        let b = external_base_dir(Path::new("/tmp/two/my-skills"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn external_base_dir_does_not_pollute_skills_root_or_its_parent() {
+        let skills_root = Path::new("/tmp/external-test/my-skills");
+        let dir = external_base_dir(skills_root);
+        assert!(!dir.starts_with(skills_root));
+        assert!(!dir.starts_with(skills_root.parent().unwrap()));
+    }
+
+    #[test]
+    fn sanitize_dir_name_replaces_unsafe_characters() {
+        assert_eq!(sanitize_dir_name("my skills"), "my-skills");
+        assert_eq!(sanitize_dir_name("a/b\\c:d"), "a-b-c-d");
+        assert_eq!(sanitize_dir_name(""), "external");
+    }
+
+    #[test]
+    fn external_base_dir_relative_path_is_stable_against_absolute_form() {
+        // For a not-yet-existing target, a relative path should namespace the
+        // same as its cwd-absolutized form. We simulate by passing both forms
+        // and asserting they match.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = Path::new("nonexistent-skills-target-xyz");
+        let abs = cwd.join(rel);
+        assert_eq!(external_base_dir(rel), external_base_dir(&abs));
+    }
+
+    #[test]
+    fn external_base_dir_normalizes_redundant_segments() {
+        // `./x`, `x`, and `a/../x` should all hash to the same namespace when
+        // none of them exist on disk.
+        let plain = external_base_dir(Path::new("nonexistent-norm-target"));
+        let dot = external_base_dir(Path::new("./nonexistent-norm-target"));
+        let parent = external_base_dir(Path::new("a/../nonexistent-norm-target"));
+        assert_eq!(plain, dot);
+        assert_eq!(plain, parent);
+    }
+
+    #[test]
+    fn lexically_normalize_handles_basic_cases() {
+        assert_eq!(
+            lexically_normalize(Path::new("/a/./b/../c")),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(
+            lexically_normalize(Path::new("./a/b")),
+            PathBuf::from("a/b")
+        );
+        assert_eq!(lexically_normalize(Path::new("/..")), PathBuf::from("/"));
+    }
 }
