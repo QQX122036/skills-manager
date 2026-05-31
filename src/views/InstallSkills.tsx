@@ -1283,7 +1283,7 @@ export function InstallSkills() {
                                       toast.loading(`正在安装 ${displayName}...`);
                                       try {
                                         await api.installFromSkillssh(analysis.source, analysis.skillId);
-                                        await Promise.all([refreshScenarios(), refreshManagedSkills()]);
+                                        await Promise.all([refreshPresets(), refreshManagedSkills()]);
                                         toast.success(`${displayName} 安装成功`);
                                       } catch (e) {
                                         toast.dismiss();

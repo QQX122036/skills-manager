@@ -28,6 +28,7 @@ import {
   ChevronDown,
   ChevronRight,
   GripVertical,
+  Key,
 } from "lucide-react";
 import {
   DndContext,

@@ -837,7 +837,10 @@ fn install_git_action(
         let skill_dir =
             cmd::resolve_skill_dir(&temp_dir, parsed.subpath.as_deref(), None).map_err(map_app_err)?;
         let revision = git_fetcher::get_head_revision(&temp_dir)?;
-        let install_result = installer::install_from_git_dir(&skill_dir, name)?;
+        let fallback_name: Option<String> = name
+            .map(|s| s.to_string())
+            .or_else(|| git_fetcher::infer_repo_name(&parsed.original_url));
+        let install_result = installer::install_from_git_dir(&skill_dir, fallback_name.as_deref())?;
         let metadata = cmd::InstallSourceMetadata {
             source_type: "git".to_string(),
             source_ref: Some(parsed.original_url.clone()),

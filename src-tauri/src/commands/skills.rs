@@ -797,6 +797,7 @@ pub async fn install_git(
                 let active = store.get_active_scenario_id().ok().flatten();
                 let skill_dir = resolve_skill_dir(&temp_dir, parsed.subpath.as_deref(), None)?;
                 let revision = git_fetcher::get_head_revision(&temp_dir).map_err(AppError::git)?;
+                let name = name.or_else(|| git_fetcher::infer_repo_name(&parsed.original_url));
                 let result = installer::install_from_git_dir(&skill_dir, name.as_deref())
                     .map_err(AppError::io)?;
                 let metadata = InstallSourceMetadata {

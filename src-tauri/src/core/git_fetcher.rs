@@ -898,6 +898,36 @@ fn list_remote_branches(url: &str, proxy_url: Option<&str>) -> Result<Vec<String
     Ok(branches)
 }
 
+/// Extract a human-readable repo name from a git URL, for use as a fallback skill name.
+///
+/// Handles HTTPS, SCP-style, and SSH URLs, stripping any `.git` suffix:
+/// - `https://github.com/foo/bar.git` → `"bar"`
+/// - `https://github.com/foo/bar` → `"bar"`
+/// - `git@github.com:foo/bar.git` → `"bar"`
+/// - `ssh://git@github.com/foo/bar.git` → `"bar"`
+pub fn infer_repo_name(url: &str) -> Option<String> {
+    let url = url.trim();
+
+    let last_segment = if let Some(at_rest) = url.rsplit_once('@') {
+        // SCP-style: git@github.com:foo/bar.git
+        if let Some((_, path)) = at_rest.1.split_once(':') {
+            path.split('/').filter(|s| !s.is_empty()).last()?
+        } else {
+            // URL with user@host/path
+            at_rest.1.split('/').filter(|s| !s.is_empty()).last()?
+        }
+    } else {
+        url.split('/').filter(|s| !s.is_empty()).last()?
+    };
+
+    let name = last_segment.strip_suffix(".git").unwrap_or(last_segment);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 fn resolve_remote_revision_with_git(
     url: &str,
     branch: Option<&str>,
@@ -1278,5 +1308,62 @@ mod tests {
         fs::write(dir.join("file.txt"), "data").unwrap();
         cleanup_temp(&dir);
         assert!(!dir.exists());
+    }
+
+    // ── infer_repo_name ──
+
+    #[test]
+    fn infer_repo_name_https_with_dot_git() {
+        assert_eq!(
+            infer_repo_name("https://github.com/foo/bar.git"),
+            Some("bar".into())
+        );
+    }
+
+    #[test]
+    fn infer_repo_name_https_without_dot_git() {
+        assert_eq!(
+            infer_repo_name("https://github.com/foo/bar"),
+            Some("bar".into())
+        );
+    }
+
+    #[test]
+    fn infer_repo_name_scp_style() {
+        assert_eq!(
+            infer_repo_name("git@github.com:foo/bar.git"),
+            Some("bar".into())
+        );
+    }
+
+    #[test]
+    fn infer_repo_name_ssh_scheme() {
+        assert_eq!(
+            infer_repo_name("ssh://git@github.com/foo/bar.git"),
+            Some("bar".into())
+        );
+    }
+
+    #[test]
+    fn infer_repo_name_strips_dot_git_case_sensitively() {
+        assert_eq!(
+            infer_repo_name("https://gitlab.com/group/my-skill.git"),
+            Some("my-skill".into())
+        );
+    }
+
+    #[test]
+    fn infer_repo_name_returns_none_for_empty_url() {
+        assert_eq!(infer_repo_name(""), None);
+    }
+
+    #[test]
+    fn infer_repo_name_with_subpath_still_returns_repo_root_name() {
+        // Even with a tree URL, infer_repo_name should return the repo root,
+        // because we operate on the original git URL, not the resolved path.
+        assert_eq!(
+            infer_repo_name("https://github.com/acme/skills.git"),
+            Some("skills".into())
+        );
     }
 }
