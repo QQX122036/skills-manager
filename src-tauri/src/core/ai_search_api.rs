@@ -300,7 +300,7 @@ calculation";
     );
 
     let request = ChatRequest {
-        model: "MiniMax-M2.7".to_string(),
+        model: "MiniMax-M3".to_string(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -323,7 +323,7 @@ calculation";
 
     let request_url = format!("{}/chat/completions", base_url);
     log::info!("AI API request URL: {}", request_url);
-    log::info!("AI API model: MiniMax-M2.7");
+    log::info!("AI API model: MiniMax-M3");
 
     let response = client
         .post(&request_url)
@@ -695,7 +695,7 @@ fn ai_direct_recommend_and_verify(
     log::info!("AI direct recommendation URL: {}", request_url);
 
     let request = ChatRequest {
-        model: "MiniMax-M2.7".to_string(),
+        model: "MiniMax-M3".to_string(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -1682,7 +1682,7 @@ keyword3
     let request_url = format!("{}/chat/completions", base_url);
 
     let request = ChatRequest {
-        model: "MiniMax-M2.7".to_string(),
+        model: "MiniMax-M3".to_string(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -1792,7 +1792,7 @@ fn analyze_skills_with_feedback(
     log::info!("AI conversation analysis URL: {}", request_url);
 
     let request = ChatRequest {
-        model: "MiniMax-M2.7".to_string(),
+        model: "MiniMax-M3".to_string(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -1905,7 +1905,7 @@ pub fn analyze_skills(
     log::info!("AI batch analysis URL: {}", request_url);
 
     let request = ChatRequest {
-        model: "MiniMax-M2.7".to_string(),
+        model: "MiniMax-M3".to_string(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
