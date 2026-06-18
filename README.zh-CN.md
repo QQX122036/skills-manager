@@ -9,6 +9,12 @@
 </p>
 
 <p align="center">
+  🎬 <a href="https://www.bilibili.com/video/BV1845F6REUu/">视频介绍（Bilibili）</a>
+  &nbsp;·&nbsp;
+  <a href="https://www.youtube.com/watch?v=wfbCrfNASVU">Video intro (YouTube)</a>
+</p>
+
+<p align="center">
   <a href="./README.md">English</a>
 </p>
 
@@ -92,7 +98,7 @@
 
 ## 支持的工具
 
-Cursor · Claude Code · Codex · OpenCode · Amp · Kilo Code · Roo Code · Goose · Gemini CLI · GitHub Copilot · Windsurf · TRAE IDE · Antigravity · Clawdbot · Droid
+Cursor · Claude Code · Codex · Grok · OpenCode · Amp · Kilo Code · Roo Code · Goose · Gemini CLI · GitHub Copilot · Windsurf · TRAE IDE · Antigravity · Clawdbot · Droid
 
 你也可以在**设置**中添加自定义工具，以相同方式管理其 Skills。
 

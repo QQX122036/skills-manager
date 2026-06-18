@@ -61,8 +61,16 @@ interface ProjectSkillGroup {
   centerSkillIds: string[];
 }
 
+// Keys of project agents that can actually receive skills right now: both
+// installed on disk and enabled by the user. Used everywhere export targets
+// are derived so disabled/uninstalled agents never get project-local skills.
+function enabledInstalledAgentKeys(targets: ProjectAgentTarget[]): string[] {
+  return targets.filter((target) => target.installed && target.enabled).map((target) => target.key);
+}
+
 function getDefaultExportAgents(targets: ProjectAgentTarget[], savedValue?: string | null) {
-  const availableKeys = new Set(targets.map((target) => target.key));
+  const enabledKeys = enabledInstalledAgentKeys(targets);
+  const availableKeys = new Set(enabledKeys);
   if (savedValue) {
     try {
       const parsed = JSON.parse(savedValue);
@@ -78,7 +86,7 @@ function getDefaultExportAgents(targets: ProjectAgentTarget[], savedValue?: stri
   }
 
   const prioritized = PROJECT_EXPORT_AGENT_PRIORITY.filter((key) => availableKeys.has(key));
-  const fallback = targets.map((target) => target.key);
+  const fallback = enabledKeys;
   return Array.from(new Set((prioritized.length > 0 ? prioritized : fallback).slice(0, 3)));
 }
 
@@ -425,17 +433,18 @@ export function ProjectDetail() {
   );
 
   const initialSheetAgents = useMemo(() => {
-    const availableKeys = new Set(
-      exportTargets
-        .filter((tt) => tt.installed && tt.enabled)
-        .map((tt) => tt.key)
-    );
+    const availableKeys = new Set(enabledInstalledAgentKeys(exportTargets));
     if (lastUsedExportAgents && lastUsedExportAgents.length > 0) {
       const filtered = lastUsedExportAgents.filter((k) => availableKeys.has(k));
       if (filtered.length > 0) return filtered;
     }
     return selectedExportAgents.filter((k) => availableKeys.has(k));
   }, [exportTargets, lastUsedExportAgents, selectedExportAgents]);
+
+  const presetBarAgentKeys = useMemo(() => {
+    const availableKeys = new Set(enabledInstalledAgentKeys(exportTargets));
+    return selectedExportAgents.filter((key) => availableKeys.has(key));
+  }, [exportTargets, selectedExportAgents]);
 
   const enabledCount = groupedSkills.filter((s) => s.enabledCount > 0).length;
   const allTags = useMemo(() => {
@@ -982,11 +991,11 @@ export function ProjectDetail() {
         )}
 
         {/* Preset bar */}
-        {presets.length > 0 && selectedExportAgents.length > 0 && (
+        {presets.length > 0 && presetBarAgentKeys.length > 0 && (
           <PresetBar
             presets={presets}
             managedSkills={managedSkills}
-            agentKeys={selectedExportAgents}
+            agentKeys={presetBarAgentKeys}
             existsInWorkspace={presetSkillExistsInProject}
             onAddSkill={handleAddPresetSkillToProject}
             onRemoveSkill={handleRemovePresetSkillFromProject}

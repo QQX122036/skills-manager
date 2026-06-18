@@ -5,25 +5,32 @@ import { toast } from "sonner";
 import { cn } from "../utils";
 import type { GitUpstreamHealth } from "../lib/tauri";
 
+type RecoveryReason = GitUpstreamHealth | "conflict";
+
 interface Props {
   open: boolean;
-  health: GitUpstreamHealth;
+  reason: RecoveryReason;
   onClose: () => void;
   onReclone: () => Promise<void>;
 }
 
-export function GitRecoveryDialog({ open, health, onClose, onReclone }: Props) {
+export function GitRecoveryDialog({ open, reason, onClose, onReclone }: Props) {
   const { t } = useTranslation();
   const [loading, setLoading] = useState<"reclone" | null>(null);
 
   if (!open) return null;
 
+  // A conflict is already aborted by the backend; re-cloning is the only safe
+  // in-app fix, so we hide the "keep local" path for it.
+  const isConflict = reason === "conflict";
   const subtitleKey =
-    health === "unrelated_histories"
-      ? "settings.gitRecoverySubtitleUnrelated"
-      : health === "no_upstream"
-        ? "settings.gitRecoverySubtitleNoUpstream"
-        : "settings.gitRecoverySubtitleDetached";
+    reason === "conflict"
+      ? "settings.gitRecoverySubtitleConflict"
+      : reason === "unrelated_histories"
+        ? "settings.gitRecoverySubtitleUnrelated"
+        : reason === "no_upstream"
+          ? "settings.gitRecoverySubtitleNoUpstream"
+          : "settings.gitRecoverySubtitleDetached";
 
   const handleReclone = async () => {
     setLoading("reclone");
@@ -81,24 +88,26 @@ export function GitRecoveryDialog({ open, health, onClose, onReclone }: Props) {
             </p>
           </button>
 
-          <button
-            type="button"
-            onClick={() => toast.info(t("settings.gitRecoveryFallbackHint"))}
-            disabled={!!loading}
-            className="w-full text-left rounded-md border border-border-subtle bg-bg-secondary px-3 py-3 transition-colors outline-none hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <div className="flex items-center gap-2">
-              <span className="rounded-full bg-surface p-1 text-muted">
-                <GitBranch className="h-4 w-4" />
-              </span>
-              <span className="text-[13px] font-semibold text-primary">
-                {t("settings.gitRecoveryCardKeepLocalTitle")}
-              </span>
-            </div>
-            <p className="mt-1.5 pl-7 text-[12px] text-tertiary leading-relaxed">
-              {t("settings.gitRecoveryCardKeepLocalDesc")}
-            </p>
-          </button>
+          {!isConflict && (
+            <button
+              type="button"
+              onClick={() => toast.info(t("settings.gitRecoveryFallbackHint"))}
+              disabled={!!loading}
+              className="w-full text-left rounded-md border border-border-subtle bg-bg-secondary px-3 py-3 transition-colors outline-none hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <div className="flex items-center gap-2">
+                <span className="rounded-full bg-surface p-1 text-muted">
+                  <GitBranch className="h-4 w-4" />
+                </span>
+                <span className="text-[13px] font-semibold text-primary">
+                  {t("settings.gitRecoveryCardKeepLocalTitle")}
+                </span>
+              </div>
+              <p className="mt-1.5 pl-7 text-[12px] text-tertiary leading-relaxed">
+                {t("settings.gitRecoveryCardKeepLocalDesc")}
+              </p>
+            </button>
+          )}
         </div>
 
         <div className="mt-5 flex justify-end">

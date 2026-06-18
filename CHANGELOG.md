@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.2] - 2026-06-17
+
+### Release Overview
+- A sync-accuracy fix: copy-mode skills that contain Python scripts no longer get falsely flagged "center changed" after their scripts run, because compiled-Python artifacts are now excluded from skill content hashing.
+
+### User-facing
+- **Running a skill's Python scripts no longer marks it as out-of-sync** — For skills deployed in copy mode, executing their Python scripts created `__pycache__/*.pyc` bytecode caches inside the agent's copy. Those cache files were folded into the skill's content hash, so the copy diverged from the central library and the skill stayed flagged "center changed" until a manual re-sync. `__pycache__` directories and `*.pyc` files are now excluded from content hashing (and from the source-diff view), so a skill keeps reading as in-sync after its scripts run. Symlink-mode skills were never affected, since the deployed link and the library are the same files.
+
+### Developer & Governance
+- `content_hash` now ignores `__pycache__` and `*.pyc` through the shared `list_content_files` enumeration, so the update badge and the source-diff stay consistent; added unit tests covering both a `__pycache__` directory and a loose `.pyc` file.
+
+## [1.23.1] - 2026-06-10
+
+### Release Overview
+- A Windows link-mode rescue release: when Windows blocks symlink creation (no admin rights, Developer Mode off), skills now sync as directory junctions instead of silently degrading to full copies. Also adds a CI job that finally runs the Rust test suite on macOS and Windows.
+
+### User-facing
+- **Symlink mode now works on Windows without Developer Mode** — Creating real symlinks on Windows requires admin rights or Developer Mode, so for most users the "symlink" sync mode silently fell back to copying every skill into each agent's folder, ballooning disk usage for large skills. When a symlink cannot be created, Skills Manager now creates a directory junction instead — junctions need no privilege on local NTFS volumes and stay live-linked to the central library exactly like symlinks. Full copy remains only as the last resort, e.g. for WSL targets (`\\wsl.localhost\...`), which Windows cannot link to from user mode (#126, #38). Note: targets that already degraded to copies are not converted automatically — trigger a manual re-sync (or update the skill) to switch them to junctions.
+- **Dangling directory links are now removed correctly on Windows** — Deleting a synced skill whose directory symlink/junction pointed at an already-removed source used to fail silently and leave a broken link behind; removal now classifies links by their own metadata instead of following them.
+
+### Developer & Governance
+- New `Test` CI workflow runs `cargo test` on macOS and Windows for every push/PR touching `src-tauri/`, so `cfg(windows)` code paths (symlink/junction sync, removal) are finally exercised automatically; a `taskkill vctip.exe` step keeps the Windows post-job cache save from flaking.
+- Skill content hashes now use `/` path separators on Windows too, so identical skill content hashes identically across platforms; existing Windows hashes recompute once on next sync.
+- Fixed the pull-conflict git test to pin the bare remote's initial branch to `main` — CI runners have no global `init.defaultBranch`, which left the cloned repo on an unborn branch and broke the test everywhere except dev machines.
+## [1.23.0] - 2026-06-06
+
+### Release Overview
+- A release centered on cleaner skill/preset boundaries: installing a skill now only adds it to the central library instead of silently joining the active preset, and preset exports and agent ordering respect which agents are actually enabled. Also adds Grok as a built-in agent.
+
+### User-facing
+- **Grok is now a built-in agent** — Grok ships out of the box with skill paths at `~/.grok/skills` and `<repo>/.grok/skills`, slotted right after Codex in the default order and the Settings agent group, with its own icon.
+- **Installing a skill no longer auto-adds it to the active preset** — Installs now only add the skill to the central library. Previously each install was silently added to whichever preset was active and synced to your agents; because the active preset drifts (creating a preset auto-activates it, deleting the active one picks a replacement, startup restores the default), skills leaked into unintended presets and had to be removed by hand. To enable an installed skill, add it to a preset (or install it to an agent) explicitly — matching the CLI, which already behaved this way (#213).
+- **Preset exports target only enabled agents** — Exporting a preset to a project now writes to agents that are both installed and enabled, instead of also touching disabled ones, so a disabled agent no longer receives preset skills (#206).
+- **Newly added agents keep their canonical order** — For users who already have a saved agent order, a newly registered priority agent (such as Grok) is now inserted right after its predecessor in the default order instead of being appended at the bottom.
+
+### Developer & Governance
+- All five desktop install paths now pass `None` to `store_installed_skill_unlocked` instead of the active scenario, and the batch-import "already exists" branch no longer re-adds skills to the active preset; the function's `Option` parameter is retained for the CLI's `--sync` / `--sync-preset` (#213, #214).
+- Collapsed the duplicated `installed && enabled` agent-filter predicate (`getDefaultExportAgents`, `initialSheetAgents`, `presetBarAgentKeys`) into a single `enabledInstalledAgentKeys()` helper so the availability rule cannot drift between call sites (#206).
+- `merge_order` now inserts a new priority agent right after its predecessor in `DEFAULT_PRIORITY_ORDER` (non-priority agents still append), with unit tests for fresh install, new-priority insertion, and non-priority append.
+- Added video intro links (YouTube + Bilibili) to the README.
+## [1.22.5] - 2026-06-01
+
+### Release Overview
+- A Git-sync reliability release: the very first backup to a fresh remote now actually uploads instead of silently reporting "Up to date", conflicting edits from two machines recover gracefully instead of wedging the library, and Git operations are now logged so sync problems can be diagnosed. Built-in agents also gain editable project skill paths.
+
+### User-facing
+- **First backup to a new remote now uploads** — Setting up backup against a freshly created empty repository used to commit everything locally but never push, so Sync reported "Up to date" while the remote stayed empty. The first sync now correctly performs the initial push (setting up upstream tracking), so a new remote is populated as expected (#162, #179, #116).
+- **Sync conflicts recover instead of breaking the library** — When two machines edited the same skill and both synced, the merge conflict left the repository in a stuck state that blocked all future syncs (and could even prevent the app from loading). Sync now rolls back the failed merge automatically and offers a one-click "re-clone from remote" recovery, with skills that exist only locally preserved (#169).
+- **Built-in agents get editable project skill paths** — The per-project skills path (and reset-to-default) that was previously only available for custom agents now works for built-in agents too. Each path row exposes edit/reset actions on hover for both the global and project paths.
+
+### Developer & Governance
+- Fixed the sync push gate in `handleGitSync`: a `no_upstream` repo reports `ahead = 0` (there is no `@{upstream}` to diff against), so the old `committed || ahead > 0` condition skipped the first push entirely. It now also pushes when `upstream_health === "no_upstream"`, relying on the backend `push -u` path to establish tracking.
+- Added structured logging across the Git backup subsystem (`init`/`set_remote`/`commit`/`push`/`pull`/`snapshot`/`restore`/`clone`/`reclone`) at INFO, with a single WARN failure chokepoint in `run_git_checked`; remote URLs are redacted. Previously the subsystem emitted no logs, leaving "sync silently did nothing" reports undiagnosable.
+- `pull_unlocked` now runs the merge via `run_git` and, on conflict, logs a warning, runs best-effort `git merge --abort` to clear the conflicted tree and `MERGE_HEAD`, then bails with a recognizable `SYNC_CONFLICT` error; the frontend routes that to the recovery dialog (re-clone only for conflicts). Regression tests cover first-push-to-empty-remote and the two-sided conflict abort.
+- Built-in agent project-path overrides persist in a new `custom_tool_project_paths` setting (an empty value or one equal to the built-in default clears the override); the Settings path UI was unified so global and project rows share the same right-aligned hover actions.
 ## [1.22.4] - 2026-05-30
 
 ### Release Overview

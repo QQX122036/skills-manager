@@ -17,6 +17,7 @@ pub struct ToolInfo {
     pub is_custom: bool,
     pub has_path_override: bool,
     pub project_relative_skills_dir: Option<String>,
+    pub has_project_path_override: bool,
     pub category: ToolCategory,
 }
 
@@ -31,7 +32,9 @@ pub fn get_disabled_tools(store: &SkillStore) -> Vec<String> {
 
 const DEFAULT_PRIORITY_ORDER: &[&str] = &[
     "claude_code",
+    "omp_agent",
     "codex",
+    "grok",
     "gemini_cli",
     "cursor",
     "opencode",
@@ -57,8 +60,12 @@ pub fn set_tool_order(store: &SkillStore, order: &[String]) -> Result<(), AppErr
 /// Merge a saved tool order with the actual list of available tool keys.
 /// - Keeps saved entries in their saved order (filtering out keys that no longer exist).
 /// - If saved is empty, seeds with the built-in default priority list.
-/// - Appends any remaining keys (e.g. newly registered agents) at the end in
-///   their natural adapter order.
+/// - Slots a newly-registered priority agent into its canonical position
+///   (right after the previous priority agent already present) so e.g. a new
+///   built-in `grok` lands next to `codex` even for users who already have a
+///   saved order, instead of being dumped at the bottom.
+/// - Appends any remaining keys (non-priority new agents) at the end in their
+///   natural adapter order.
 fn merge_order(saved: &[String], all_keys: &[String]) -> Vec<String> {
     let all_set: HashSet<&str> = all_keys.iter().map(|s| s.as_str()).collect();
     let mut out: Vec<String> = Vec::with_capacity(all_keys.len());
@@ -73,6 +80,21 @@ fn merge_order(saved: &[String], all_keys: &[String]) -> Vec<String> {
         for k in DEFAULT_PRIORITY_ORDER {
             if all_set.contains(*k) {
                 out.push((*k).to_string());
+            }
+        }
+    }
+
+    let mut anchor: Option<usize> = None;
+    for key in DEFAULT_PRIORITY_ORDER {
+        if !all_set.contains(*key) {
+            continue;
+        }
+        match out.iter().position(|x| x == key) {
+            Some(idx) => anchor = Some(idx),
+            None => {
+                let insert_at = anchor.map_or(0, |a| a + 1);
+                out.insert(insert_at, (*key).to_string());
+                anchor = Some(insert_at);
             }
         }
     }
@@ -110,6 +132,21 @@ pub fn set_custom_tool_paths(
         .map_err(|e| AppError::internal(format!("Failed to serialize: {e}")))?;
     store
         .set_setting("custom_tool_paths", &json)
+        .map_err(AppError::db)
+}
+
+pub fn get_custom_tool_project_paths(store: &SkillStore) -> HashMap<String, String> {
+    tool_adapters::custom_tool_project_paths(store)
+}
+
+pub fn set_custom_tool_project_paths(
+    store: &SkillStore,
+    paths: &HashMap<String, String>,
+) -> Result<(), AppError> {
+    let json = serde_json::to_string(paths)
+        .map_err(|e| AppError::internal(format!("Failed to serialize: {e}")))?;
+    store
+        .set_setting("custom_tool_project_paths", &json)
         .map_err(AppError::db)
 }
 
@@ -177,6 +214,7 @@ pub fn normalize_project_relative_skills_dir_input(path: &str) -> Result<Option<
 
 pub fn list_tool_info(store: &SkillStore) -> Vec<ToolInfo> {
     let disabled = disabled_tools_set(store);
+    let project_overrides = get_custom_tool_project_paths(store);
     let infos: Vec<ToolInfo> = tool_adapters::all_tool_adapters(store)
         .into_iter()
         .map(|adapter| ToolInfo {
@@ -195,6 +233,10 @@ pub fn list_tool_info(store: &SkillStore) -> Vec<ToolInfo> {
                     Some(project_dir.to_string())
                 }
             },
+            // Only built-in adapters have a default project path to reset back to;
+            // custom tools clear their path instead of resetting.
+            has_project_path_override: !adapter.is_custom
+                && project_overrides.contains_key(&adapter.key),
             category: adapter.category,
         })
         .collect();
@@ -213,6 +255,7 @@ pub fn list_tool_info(store: &SkillStore) -> Vec<ToolInfo> {
 pub fn migrate_legacy_tool_keys(store: &SkillStore) -> Result<(), AppError> {
     const OLD_KEY: &str = "clawdbot";
     const NEW_KEY: &str = "openclaw";
+    const LEGACY_OMP_KEY: &str = "omp_agent";
 
     let mut changed = false;
 
@@ -230,29 +273,50 @@ pub fn migrate_legacy_tool_keys(store: &SkillStore) -> Result<(), AppError> {
     }
 
     let mut custom_paths = get_custom_tool_paths(store);
+    let mut custom_paths_changed = false;
     if let Some(old_path) = custom_paths.remove(OLD_KEY) {
         custom_paths.entry(NEW_KEY.to_string()).or_insert(old_path);
-        set_custom_tool_paths(store, &custom_paths)?;
+        custom_paths_changed = true;
         changed = true;
     }
 
-    let mut normalized_path_changed = false;
-    for value in custom_paths.values_mut() {
-        if let Ok(normalized) = normalize_skills_dir_input(value) {
-            if *value != normalized {
-                *value = normalized;
-                normalized_path_changed = true;
+    let mut custom_project_paths = get_custom_tool_project_paths(store);
+    let mut custom_project_paths_changed = false;
+
+    let mut custom_tools = get_custom_tools(store);
+    let mut legacy_omp_skills_dir = None;
+    let mut legacy_omp_project_path = None;
+    let original_custom_tool_count = custom_tools.len();
+    custom_tools.retain(|custom| {
+        if custom.key != LEGACY_OMP_KEY {
+            return true;
+        }
+        if legacy_omp_skills_dir.is_none() {
+            legacy_omp_skills_dir = Some(custom.skills_dir.clone());
+        }
+        if legacy_omp_project_path.is_none() {
+            legacy_omp_project_path = custom.project_relative_skills_dir.clone();
+        }
+        false
+    });
+    let mut custom_tools_changed = custom_tools.len() != original_custom_tool_count;
+    if custom_tools_changed {
+        changed = true;
+        if let Some(skills_dir) = legacy_omp_skills_dir {
+            if !custom_paths.contains_key(LEGACY_OMP_KEY) {
+                custom_paths.insert(LEGACY_OMP_KEY.to_string(), skills_dir);
+                custom_paths_changed = true;
+            }
+        }
+        if let Some(project_path) = legacy_omp_project_path {
+            if !custom_project_paths.contains_key(LEGACY_OMP_KEY) {
+                custom_project_paths.insert(LEGACY_OMP_KEY.to_string(), project_path);
+                custom_project_paths_changed = true;
             }
         }
     }
-    if normalized_path_changed {
-        set_custom_tool_paths(store, &custom_paths)?;
-        changed = true;
-    }
 
-    let custom_tools = get_custom_tools(store);
-    let mut custom_tools_changed = false;
-    let custom_tools = if custom_tools.iter().any(|c| c.key == OLD_KEY) {
+    if custom_tools.iter().any(|c| c.key == OLD_KEY) {
         let has_new = custom_tools.iter().any(|c| c.key == NEW_KEY);
         let mut migrated = Vec::with_capacity(custom_tools.len());
         let mut seen_keys = std::collections::HashSet::new();
@@ -267,15 +331,22 @@ pub fn migrate_legacy_tool_keys(store: &SkillStore) -> Result<(), AppError> {
                 migrated.push(custom);
             }
         }
+        custom_tools = migrated;
         custom_tools_changed = true;
         changed = true;
-        migrated
-    } else {
-        custom_tools
-    };
+    }
 
-    let mut normalized_customs = custom_tools;
-    for custom in &mut normalized_customs {
+    for value in custom_paths.values_mut() {
+        if let Ok(normalized) = normalize_skills_dir_input(value) {
+            if *value != normalized {
+                *value = normalized;
+                custom_paths_changed = true;
+                changed = true;
+            }
+        }
+    }
+
+    for custom in &mut custom_tools {
         if let Ok(normalized) = normalize_skills_dir_input(&custom.skills_dir) {
             if custom.skills_dir != normalized {
                 custom.skills_dir = normalized;
@@ -283,8 +354,16 @@ pub fn migrate_legacy_tool_keys(store: &SkillStore) -> Result<(), AppError> {
             }
         }
     }
+
+    if custom_paths_changed {
+        set_custom_tool_paths(store, &custom_paths)?;
+    }
+    if custom_project_paths_changed {
+        set_custom_tool_project_paths(store, &custom_project_paths)?;
+        changed = true;
+    }
     if custom_tools_changed {
-        set_custom_tools(store, &normalized_customs)?;
+        set_custom_tools(store, &custom_tools)?;
     }
 
     if changed || store.has_tool_key_references(OLD_KEY).map_err(AppError::db)? {
@@ -293,7 +372,159 @@ pub fn migrate_legacy_tool_keys(store: &SkillStore) -> Result<(), AppError> {
             .map_err(AppError::db)?;
     }
     if changed {
-        log::info!("Migrated legacy tool key {OLD_KEY} -> {NEW_KEY}");
+        log::info!("Migrated legacy tool settings");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+
+    fn v(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fresh_install_uses_default_priority_order() {
+        let all = v(&[
+            "cursor",
+            "claude_code",
+            "omp_agent",
+            "codex",
+            "grok",
+            "gemini_cli",
+            "opencode",
+        ]);
+        let order = merge_order(&[], &all);
+        // Priority list comes first, then remaining adapters in their natural order.
+        assert_eq!(order[0], "claude_code");
+        assert_eq!(order[1], "omp_agent");
+        assert_eq!(order[2], "codex");
+        assert_eq!(order[3], "grok");
+    }
+
+    #[test]
+    fn new_priority_agent_slots_after_its_predecessor() {
+        // Existing user whose saved order predates `grok`.
+        let saved = v(&["claude_code", "codex", "gemini_cli", "cursor", "opencode"]);
+        let all = v(&["cursor", "claude_code", "codex", "grok", "gemini_cli", "opencode"]);
+        let order = merge_order(&saved, &all);
+        let codex = order.iter().position(|k| k == "codex").unwrap();
+        assert_eq!(order[codex + 1], "grok", "grok must land right after codex");
+        // Existing entries keep their relative order.
+        assert!(
+            order.iter().position(|k| k == "gemini_cli").unwrap()
+                > order.iter().position(|k| k == "grok").unwrap()
+        );
+    }
+
+    #[test]
+    fn new_omp_agent_slots_after_claude_code_for_existing_users() {
+        let saved = v(&["claude_code", "codex", "grok", "gemini_cli", "cursor", "opencode"]);
+        let all = v(&[
+            "cursor",
+            "claude_code",
+            "omp_agent",
+            "codex",
+            "grok",
+            "gemini_cli",
+            "opencode",
+        ]);
+        let order = merge_order(&saved, &all);
+        let claude_code = order.iter().position(|k| k == "claude_code").unwrap();
+        let omp_agent = order.iter().position(|k| k == "omp_agent").unwrap();
+        let codex = order.iter().position(|k| k == "codex").unwrap();
+        assert_eq!(order[claude_code + 1], "omp_agent");
+        assert!(codex > omp_agent, "codex must remain after omp_agent");
+    }
+
+    #[test]
+    fn non_priority_new_agent_appends_at_end() {
+        let saved = v(&["claude_code", "codex"]);
+        let all = v(&["claude_code", "codex", "some_new_tool"]);
+        let order = merge_order(&saved, &all);
+        assert_eq!(order.last().unwrap(), "some_new_tool");
+    }
+    #[test]
+    fn migrates_custom_omp_agent_to_builtin_overrides() {
+        let tmp = tempdir().unwrap();
+        let store = SkillStore::new(&tmp.path().join("test.db")).unwrap();
+        let legacy_skills = tmp.path().join("legacy-skills");
+        let explicit_skills = tmp.path().join("explicit-skills");
+
+        set_custom_tools(
+            &store,
+            &[
+                CustomToolDef {
+                    key: "omp_agent".to_string(),
+                    display_name: "Legacy Custom OMP".to_string(),
+                    skills_dir: legacy_skills.to_string_lossy().into_owned(),
+                    project_relative_skills_dir: Some(".legacy/skills".to_string()),
+                    category: ToolCategory::Lobster,
+                },
+                CustomToolDef {
+                    key: "custom_agent".to_string(),
+                    display_name: "Custom Agent".to_string(),
+                    skills_dir: tmp.path().join("custom-skills").to_string_lossy().into_owned(),
+                    project_relative_skills_dir: Some(".custom/skills".to_string()),
+                    category: ToolCategory::Lobster,
+                },
+            ],
+        )
+        .unwrap();
+
+        migrate_legacy_tool_keys(&store).unwrap();
+
+        let customs = get_custom_tools(&store);
+        assert!(!customs.iter().any(|custom| custom.key == "omp_agent"));
+        assert!(customs.iter().any(|custom| custom.key == "custom_agent"));
+
+        let custom_paths = get_custom_tool_paths(&store);
+        assert_eq!(custom_paths.get("omp_agent"), Some(&legacy_skills.to_string_lossy().into_owned()));
+
+        let project_paths = get_custom_tool_project_paths(&store);
+        assert_eq!(project_paths.get("omp_agent"), Some(&".legacy/skills".to_string()));
+
+        set_custom_tools(
+            &store,
+            &[CustomToolDef {
+                key: "omp_agent".to_string(),
+                display_name: "Legacy Custom OMP".to_string(),
+                skills_dir: legacy_skills.to_string_lossy().into_owned(),
+                project_relative_skills_dir: Some(".legacy/skills".to_string()),
+                category: ToolCategory::Lobster,
+            }],
+        )
+        .unwrap();
+        set_custom_tool_paths(
+            &store,
+            &HashMap::from([(
+                "omp_agent".to_string(),
+                explicit_skills.to_string_lossy().into_owned(),
+            )]),
+        )
+        .unwrap();
+        set_custom_tool_project_paths(
+            &store,
+            &HashMap::from([(
+                "omp_agent".to_string(),
+                ".explicit/skills".to_string(),
+            )]),
+        )
+        .unwrap();
+
+        migrate_legacy_tool_keys(&store).unwrap();
+
+        let customs = get_custom_tools(&store);
+        assert!(!customs.iter().any(|custom| custom.key == "omp_agent"));
+
+        let custom_paths = get_custom_tool_paths(&store);
+        assert_eq!(custom_paths.get("omp_agent"), Some(&explicit_skills.to_string_lossy().into_owned()));
+
+        let project_paths = get_custom_tool_project_paths(&store);
+        assert_eq!(project_paths.get("omp_agent"), Some(&".explicit/skills".to_string()));
+    }
 }

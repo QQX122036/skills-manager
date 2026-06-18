@@ -189,6 +189,7 @@ pub(crate) fn init_repo_unlocked(skills_dir: &Path) -> Result<()> {
         &["commit", "-m", "Initial skill library snapshot"],
     )?;
 
+    log::info!("git init: initialized repository on branch main");
     Ok(())
 }
 
@@ -209,7 +210,9 @@ pub(crate) fn set_remote_unlocked(skills_dir: &Path, url: &str) -> Result<()> {
     }
 
     // Fetch remote to set up tracking
-    let _ = run_git(skills_dir, &["fetch", "origin"]);
+    if let Err(e) = run_git(skills_dir, &["fetch", "origin"]) {
+        log::warn!("git set_remote: initial fetch failed (continuing): {e}");
+    }
 
     // Set upstream tracking if branch exists on remote
     let branch = run_git(skills_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
@@ -223,6 +226,13 @@ pub(crate) fn set_remote_unlocked(skills_dir: &Path, url: &str) -> Result<()> {
             &branch,
         ],
     );
+
+    // Whether tracking got established decides the whole sync path: with no
+    // upstream the first push must use `-u` and the "ahead" count reads 0.
+    // Logging it here is what makes "Sync says up to date but remote is empty"
+    // diagnosable from a single log line.
+    let upstream_tracking = run_git(skills_dir, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_ok();
+    log::info!("git set_remote: origin configured on branch {branch}, upstream_tracking={upstream_tracking}");
 
     Ok(())
 }
@@ -243,10 +253,12 @@ pub(crate) fn commit_all_unlocked(skills_dir: &Path, message: &str) -> Result<()
     // Check if there's anything to commit
     let status = run_git(skills_dir, &["status", "--porcelain"])?;
     if status.is_empty() {
+        log::info!("git commit: working tree clean, nothing to commit");
         anyhow::bail!("Nothing to commit");
     }
 
     run_git_checked(skills_dir, &["commit", "-m", message])?;
+    log::info!("git commit: committed staged changes");
     Ok(())
 }
 
@@ -261,10 +273,12 @@ pub(crate) fn push_unlocked(skills_dir: &Path) -> Result<()> {
 
     let branch = run_git(skills_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_else(|_| "main".to_string());
+    log::info!("git push: starting on branch {branch}");
 
     // Push branch first; if no upstream, set it.
     let result = run_git(skills_dir, &["push"]);
     if result.is_err() {
+        log::info!("git push: no upstream tracking, retrying with -u origin {branch}");
         run_git_checked(skills_dir, &["push", "-u", "origin", &branch])?;
     }
 
@@ -301,14 +315,19 @@ pub(crate) fn push_unlocked(skills_dir: &Path) -> Result<()> {
             let mut cmd = git_command();
             cmd.arg("-C").arg(skills_dir).arg("push").arg("origin");
             cmd.args(&missing_tag_refs);
+            let pushed = missing_tag_refs.len();
             let output = cmd.output().context("Failed to run git command")?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                anyhow::bail!("git command failed: {}", redact_urls_in_text(&stderr));
+                let redacted = redact_urls_in_text(&stderr);
+                log::warn!("git push: snapshot tag push failed: {redacted}");
+                anyhow::bail!("git command failed: {}", redacted);
             }
+            log::info!("git push: pushed {pushed} snapshot tag(s)");
         }
     }
 
+    log::info!("git push: done");
     Ok(())
 }
 
@@ -324,9 +343,21 @@ pub(crate) fn pull_unlocked(skills_dir: &Path) -> Result<()> {
     ensure_no_interrupted_git_operation(skills_dir)?;
     let branch = run_git(skills_dir, &["rev-parse", "--abbrev-ref", "HEAD"])
         .unwrap_or_else(|_| "main".to_string());
+    log::info!("git pull: fetch + merge origin/{branch}");
 
     run_git_checked(skills_dir, &["fetch", "origin", &branch])?;
-    run_git_checked(skills_dir, &["merge", &format!("origin/{branch}")])?;
+    if let Err(e) = run_git(skills_dir, &["merge", &format!("origin/{branch}")]) {
+        // A failed merge — almost always a content conflict on a SKILL.md body
+        // edited on two machines — leaves the working tree conflicted with
+        // MERGE_HEAD behind, which `ensure_no_interrupted_git_operation` would
+        // then treat as a hard block on every future sync. Abort to restore a
+        // clean tree, and surface a recognizable conflict error so the UI can
+        // route the user to recovery (re-clone) instead of leaving them stuck.
+        log::warn!("git pull: merge failed, aborting to clear conflicted state: {e}");
+        let _ = run_git(skills_dir, &["merge", "--abort"]);
+        anyhow::bail!("SYNC_CONFLICT: local and remote skill changes conflict ({e})");
+    }
+    log::info!("git pull: done");
     Ok(())
 }
 
@@ -356,7 +387,9 @@ pub(crate) fn create_snapshot_tag_unlocked(skills_dir: &Path) -> Result<String> 
         .lines()
         .find(|line| !line.trim().is_empty())
     {
-        return Ok(tag.trim().to_string());
+        let tag = tag.trim().to_string();
+        log::info!("git snapshot: reusing existing tag {tag} on HEAD");
+        return Ok(tag);
     }
 
     let short_sha = run_git(skills_dir, &["rev-parse", "--short", "HEAD"])?;
@@ -376,6 +409,7 @@ pub(crate) fn create_snapshot_tag_unlocked(skills_dir: &Path) -> Result<String> 
 
     // Use lightweight tag to avoid requiring git user.name/user.email on client machines.
     run_git_checked(skills_dir, &["tag", &tag])?;
+    log::info!("git snapshot: created tag {tag}");
     Ok(tag)
 }
 
@@ -440,6 +474,8 @@ pub(crate) fn restore_snapshot_version_unlocked(skills_dir: &Path, tag: &str) ->
         anyhow::bail!("Working tree has uncommitted changes. Sync or commit before restore.");
     }
 
+    log::info!("git restore: switching skills library to {tag}");
+
     // Keep a restore point before we mutate the working tree.
     let head_short = run_git(skills_dir, &["rev-parse", "--short", "HEAD"])?;
     let restore_point = format!(
@@ -476,6 +512,7 @@ pub(crate) fn restore_snapshot_version_unlocked(skills_dir: &Path, tag: &str) ->
     match restore_result {
         Ok(()) => {
             cleanup();
+            log::info!("git restore: completed restore to {tag}");
             Ok(())
         }
         Err(err) => {
@@ -553,6 +590,7 @@ pub(crate) fn reclone_from_remote_unlocked(skills_dir: &Path, url: &str) -> Resu
         return clone_into_unlocked(skills_dir, url);
     }
 
+    log::info!("git reclone: re-cloning from remote, preserving local skills");
     let ts = Utc::now().format("%Y%m%d-%H%M%S");
     let git_backup = skills_dir.with_file_name(format!("skills-git-recovery-{ts}"));
     if git_backup.exists() {
@@ -623,6 +661,11 @@ pub(crate) fn clone_into_unlocked(skills_dir: &Path, url: &str) -> Result<()> {
         None
     };
 
+    log::info!(
+        "git clone: cloning {} (existing_local_content={has_existing})",
+        redact_url(url)
+    );
+
     // Clone
     let output = git_command()
         .arg("clone")
@@ -644,6 +687,7 @@ pub(crate) fn clone_into_unlocked(skills_dir: &Path, url: &str) -> Result<()> {
                 })?;
                 std::fs::remove_dir_all(&backup)?;
             }
+            log::info!("git clone: done");
             Ok(())
         }
         result => {
@@ -657,9 +701,12 @@ pub(crate) fn clone_into_unlocked(skills_dir: &Path, url: &str) -> Result<()> {
                     let stderr = String::from_utf8_lossy(&o.stderr);
                     let detail = stderr.trim();
                     if detail.is_empty() {
+                        log::warn!("git clone: failed with exit code {}", o.status);
                         anyhow::bail!("git clone failed with exit code {}", o.status)
                     } else {
-                        anyhow::bail!("git clone failed: {}", redact_urls_in_text(detail))
+                        let redacted = redact_urls_in_text(detail);
+                        log::warn!("git clone: failed: {redacted}");
+                        anyhow::bail!("git clone failed: {}", redacted)
                     }
                 }
                 Err(e) => Err(anyhow::Error::new(e).context("Failed to spawn git clone")),
@@ -752,7 +799,14 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 fn run_git_checked(dir: &Path, args: &[&str]) -> Result<()> {
-    run_git(dir, args)?;
+    if let Err(e) = run_git(dir, args) {
+        // Single chokepoint for genuine git failures: every aborting step
+        // (commit, push -u, fetch+merge, tag, read-tree, …) goes through here,
+        // so this is where "sync silently failed" becomes visible in the log.
+        // Redact the args because some carry the remote URL (which may embed a token).
+        log::warn!("git failed [{}]: {}", redact_urls_in_text(&args.join(" ")), e);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -815,6 +869,9 @@ fn redact_urls_in_text(text: &str) -> String {
         .join(" ")
 }
 
+/// Mask credentials embedded in a URL's userinfo (the `user:token@` before the
+/// host). Note: this only covers the userinfo form, not credentials passed as
+/// query parameters (e.g. `?token=…`); our remote URLs never use that form.
 fn redact_url(url: &str) -> String {
     let Some(scheme_pos) = url.find("://") else {
         return url.to_string();
@@ -1023,6 +1080,149 @@ mod tests {
         );
         // Crucial: the user file must still be there.
         assert!(target.join("user-file.txt").exists());
+    }
+
+    // ── first push to an empty remote (the no_upstream scenario) ──
+
+    #[test]
+    fn push_first_time_to_empty_remote_with_no_upstream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        // Empty bare remote — the freshly-created GitHub/Gitee repo case.
+        assert!(Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .output()
+            .unwrap()
+            .status
+            .success());
+
+        // Local repo with one commit on main. Identity is injected explicitly so
+        // the test does not depend on a global git identity (CI runners have none).
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&work)
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init"]).status.success());
+        assert!(git(&["checkout", "-b", "main"]).status.success());
+        // Pin autoSetupRemote off in the repo's local config so the plain `git push`
+        // deterministically fails and we actually exercise the `-u` fallback, even on
+        // a dev box whose global config sets push.autoSetupRemote=true.
+        assert!(git(&["config", "push.autoSetupRemote", "false"]).status.success());
+        std::fs::write(work.join("a.txt"), "hello").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "initial"]).status.success());
+
+        // Wiring the empty remote leaves no tracking branch — exactly the state
+        // that made the UI report "Up to date" while the remote stayed empty.
+        set_remote_unlocked(&work, remote.to_str().unwrap()).unwrap();
+        assert_eq!(detect_upstream_health(&work, true), "no_upstream");
+        assert_eq!(get_ahead_behind(&work).unwrap_or((0, 0)), (0, 0));
+
+        // The capability the frontend fix relies on: push must set upstream and
+        // actually populate the remote, not no-op.
+        push_unlocked(&work).unwrap();
+
+        let remote_main = Command::new("git")
+            .arg("-C")
+            .arg(&remote)
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap();
+        assert!(
+            remote_main.status.success(),
+            "remote should have branch main after first push"
+        );
+        assert_eq!(detect_upstream_health(&work, true), "healthy");
+    }
+
+    #[test]
+    fn pull_conflict_aborts_merge_and_reports_sync_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+
+        // Pin the bare repo's HEAD to main: without a global
+        // init.defaultBranch (CI runners have none) it points at master,
+        // the later clone finds a dangling HEAD and checks nothing out,
+        // and machine B's `commit -am` fails on an unborn branch.
+        assert!(Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&remote)
+            .output()
+            .unwrap()
+            .status
+            .success());
+
+        let git = |dir: &Path, args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+
+        // Machine A: seed one skill file and publish it.
+        assert!(git(&a, &["init"]).status.success());
+        assert!(git(&a, &["checkout", "-b", "main"]).status.success());
+        std::fs::write(a.join("skill.md"), "base\n").unwrap();
+        assert!(git(&a, &["add", "-A"]).status.success());
+        assert!(git(&a, &["commit", "-m", "base"]).status.success());
+        assert!(git(&a, &["remote", "add", "origin", remote.to_str().unwrap()]).status.success());
+        assert!(git(&a, &["push", "-u", "origin", "main"]).status.success());
+
+        // Machine B: clone, then both sides edit the SAME line differently.
+        assert!(Command::new("git")
+            .args(["clone", remote.to_str().unwrap()])
+            .arg(&b)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(git(&b, &["config", "user.email", "test@example.com"]).status.success());
+        assert!(git(&b, &["config", "user.name", "Test"]).status.success());
+
+        std::fs::write(a.join("skill.md"), "edited on A\n").unwrap();
+        assert!(git(&a, &["commit", "-am", "edit A"]).status.success());
+        assert!(git(&a, &["push", "origin", "main"]).status.success());
+
+        std::fs::write(b.join("skill.md"), "edited on B\n").unwrap();
+        assert!(git(&b, &["commit", "-am", "edit B"]).status.success());
+
+        // B pulls A's conflicting change. The merge must fail, be aborted, and
+        // surface a recognizable conflict error — not leave B wedged.
+        let err = pull_unlocked(&b).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("SYNC_CONFLICT"),
+            "expected a recognizable conflict error, got: {msg}"
+        );
+
+        // Crucial: the abort must clear the in-progress merge so future syncs
+        // are not permanently blocked.
+        assert!(
+            !b.join(".git/MERGE_HEAD").exists(),
+            "MERGE_HEAD should be gone after abort"
+        );
+        let porcelain = run_git(&b, &["status", "--porcelain"]).unwrap();
+        assert!(
+            porcelain.is_empty(),
+            "working tree should be clean after abort, got: {porcelain:?}"
+        );
+        // And a follow-up sync is no longer blocked by an interrupted operation.
+        ensure_no_interrupted_git_operation(&b).unwrap();
     }
 
     #[test]

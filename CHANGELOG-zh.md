@@ -5,6 +5,61 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.23.2] - 2026-06-17
+
+### 发布概览
+- 同步状态准确性修复：copy 模式下包含 Python 脚本的 skill，在脚本运行后不再被误标为「中心有变更」——编译产物现在不再计入 skill 内容哈希。
+
+### 用户可见更新
+- **运行 skill 的 Python 脚本不再导致它被标记为未同步** —— 对于以 copy 模式部署的 skill，执行其 Python 脚本会在 agent 副本里生成 `__pycache__/*.pyc` 字节码缓存。这些缓存文件此前被算进 skill 的内容哈希，导致副本与中心库不一致，该 skill 会一直被误标为「中心有变更」，直到手动重新同步。现在 `__pycache__` 目录与 `*.pyc` 文件已从内容哈希（以及来源差异视图）中排除，脚本运行后 skill 仍保持「与中心一致」。symlink 模式的 skill 从不受此影响，因为部署的链接与中心库是同一份文件。
+
+### 开发者与治理更新
+- `content_hash` 现在通过共享的 `list_content_files` 枚举忽略 `__pycache__` 与 `*.pyc`，使更新标记与来源差异视图保持一致；新增覆盖 `__pycache__` 目录与散落 `.pyc` 文件的单元测试。
+
+## [1.23.1] - 2026-06-10
+
+### 发布概览
+- Windows 链接模式救场版本：当 Windows 阻止创建符号链接时（无管理员权限、未开启开发者模式），skill 现在会以目录联接（junction）方式同步，不再静默退化为全量复制。同时新增 CI 任务，在 macOS 和 Windows 上真正运行 Rust 测试套件。
+
+### 用户可见更新
+- **Windows 上无需开发者模式即可使用符号链接模式** —— 在 Windows 上创建真正的符号链接需要管理员权限或开启开发者模式，因此对大多数用户来说，「符号链接」同步模式实际上一直在静默退化为把每个 skill 完整复制到各个 agent 目录，大体积 skill 会迅速占满磁盘。现在当符号链接创建失败时，Skills Manager 会改为创建目录联接（junction）—— junction 在本地 NTFS 卷上不需要任何特权，并且和符号链接一样与中央库保持实时联动。全量复制仅作为最后兜底保留，例如 WSL 目标路径（`\\wsl.localhost\...`），Windows 用户态无法对其建立链接（#126、#38）。注意：此前已退化为复制的目标不会自动转换，手动触发一次重新同步（或更新该 skill）即可切换为 junction。
+- **Windows 上悬空目录链接现在可以正确移除** —— 删除一个所指源目录已被移除的目录符号链接/junction，此前会静默失败并留下损坏的链接；现在移除操作根据链接自身的元数据判断类型，不再跟随链接解析。
+
+### 开发者与治理更新
+- 新增 `Test` CI workflow：凡涉及 `src-tauri/` 的 push/PR 都会在 macOS 和 Windows 上运行 `cargo test`，`cfg(windows)` 代码路径（符号链接/junction 同步与移除）终于有了自动化覆盖；并通过 `taskkill vctip.exe` 步骤避免 Windows 任务结束时缓存保存间歇性失败。
+- skill 内容哈希在 Windows 上也改用 `/` 作为路径分隔符，相同内容在各平台得到一致的哈希值；Windows 上已存的哈希会在下次同步时重新计算一次。
+- 修复 pull 冲突 git 测试：将裸仓库的初始分支固定为 `main` —— CI runner 没有全局 `init.defaultBranch` 配置，导致克隆出的仓库停在未诞生分支上，该测试在开发机以外的环境必然失败。
+## [1.23.0] - 2026-06-06
+
+### 发布概览
+- 本版聚焦更清晰的「技能 / Preset」边界：安装技能现在只加入中央库，不再悄悄并入当前 active preset；Preset 导出与 agent 排序也会尊重「实际启用的 agent」。同时新增 Grok 内置 agent。
+
+### 用户可见更新
+- **新增 Grok 内置 agent** —— Grok 现已开箱内置，技能路径为 `~/.grok/skills` 与 `<repo>/.grok/skills`，在默认顺序和设置页 agent 分组中紧随 Codex，并配有独立图标。
+- **安装技能不再自动加入当前 Preset** —— 安装现在只把技能加入中央库。此前每次安装都会被悄悄加入当前 active preset 并同步到各 agent；而 active preset 会漂移（新建 preset 自动激活、删除当前自动选替补、启动恢复默认），导致技能误进不该进的 preset，需手动逐个移除。要让已安装技能生效，请显式将其加入某个 preset（或安装到对应 agent）—— 与命令行版本行为一致（#213）。
+- **Preset 导出只面向已启用的 agent** —— 将 Preset 导出到项目时，现在只写入「已安装且已启用」的 agent，不再波及被禁用的 agent，禁用的 agent 不会再收到 Preset 技能（#206）。
+- **新增 agent 保持规范排序** —— 对已保存过 agent 顺序的用户，新注册的优先级 agent（如 Grok）现在会插入到默认顺序中其前序 agent 之后，而不是被追加到末尾。
+
+### 开发者与治理更新
+- 五条桌面安装路径现在向 `store_installed_skill_unlocked` 传 `None` 而非 active scenario，批量导入「已存在」分支不再把技能重新加入 active preset；该函数的 `Option` 参数保留给 CLI 的 `--sync` / `--sync-preset`（#213、#214）。
+- 将重复的「installed && enabled」agent 过滤判断（`getDefaultExportAgents`、`initialSheetAgents`、`presetBarAgentKeys`）合并为单一的 `enabledInstalledAgentKeys()` 辅助函数，避免各调用点的可用性规则漂移（#206）。
+- `merge_order` 现在会把新的优先级 agent 插入到 `DEFAULT_PRIORITY_ORDER` 中其前序之后（非优先级 agent 仍追加到末尾），并补充了全新安装、新优先级插入、非优先级追加的单元测试。
+- README 增加视频介绍链接（YouTube + Bilibili）。
+## [1.22.5] - 2026-06-01
+
+### 发布概览
+- 一个 Git 同步可靠性版本：对全新空远程的「首次备份」现在会真正上传，不再只显示「已同步」却让远程保持空仓；两台机器改了同一个技能造成的冲突可以优雅恢复，而不是把技能库卡死；Git 操作现在会写日志，方便排查同步问题。同时内置 agent 也支持编辑项目级技能路径。
+
+### 用户可见更新
+- **首次备份到新远程会真正上传了** —— 对着一个全新的空仓库设置备份时，以前只会在本地提交、却从不推送，于是「同步」显示「已同步」而远程一直是空的。现在首次同步会正确执行初始推送（并建立 upstream 跟踪），新远程会按预期被填充（#162、#179、#116）。
+- **同步冲突可恢复，不再弄坏技能库** —— 两台机器改了同一个技能并都点了同步时，合并冲突会让仓库进入卡死状态，阻塞之后所有同步（甚至可能导致软件打不开）。现在同步会自动回滚失败的合并，并提供一键「从远程重新克隆」恢复，仅本地存在的技能会被保留（#169）。
+- **内置 agent 支持编辑项目级技能路径** —— 之前只有自定义 agent 才能设置的「项目级技能路径」（及恢复默认）现在对内置 agent 也可用。无论全局路径还是项目路径，每一行都会在悬停时显示编辑/重置操作。
+
+### 开发者与治理更新
+- 修复 `handleGitSync` 的推送判定：`no_upstream` 状态下 `ahead` 恒为 0（没有 `@{upstream}` 可比较），导致旧的 `committed || ahead > 0` 条件完全跳过首次推送。现在当 `upstream_health === "no_upstream"` 时也会推送，依赖后端的 `push -u` 路径建立跟踪。
+- 为 Git 备份子系统加入结构化日志（`init`/`set_remote`/`commit`/`push`/`pull`/`snapshot`/`restore`/`clone`/`reclone`，INFO 级），并在 `run_git_checked` 设单一 WARN 失败汇聚点；远程 URL 会脱敏。此前该子系统不产生任何日志，使得「同步悄无声息什么都没做」类问题无法排查。
+- `pull_unlocked` 现在通过 `run_git` 执行合并，冲突时记录警告、best-effort 执行 `git merge --abort` 清理冲突工作树和 `MERGE_HEAD`，再以可识别的 `SYNC_CONFLICT` 错误返回；前端据此路由到恢复对话框（冲突态仅提供重新克隆）。新增回归测试覆盖「首次推送到空远程」和「双方冲突后中止」。
+- 内置 agent 的项目路径覆盖保存在新设置项 `custom_tool_project_paths`（留空或与内置默认相同即清除覆盖）；设置页路径 UI 已统一，全局行和项目行共用同样的右对齐悬停操作。
 ## [1.22.4] - 2026-05-30
 
 ### 发布概览

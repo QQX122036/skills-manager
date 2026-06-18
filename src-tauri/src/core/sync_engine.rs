@@ -91,13 +91,35 @@ pub fn sync_skill(source: &Path, target: &Path, mode: SyncMode) -> Result<SyncMo
                     Err(err) => {
                         // Typical causes: missing SeCreateSymbolicLinkPrivilege,
                         // Developer Mode disabled, or non-NTFS target volume.
-                        log::warn!(
-                            "symlink_dir {:?} -> {:?} failed, falling back to copy: {err}",
-                            target,
-                            source
-                        );
-                        copy_dir_recursive(source, target)?;
-                        Ok(SyncMode::Copy)
+                        // A directory junction needs no privilege on local NTFS
+                        // volumes and is equivalent for our purposes (issue #126),
+                        // so try that before degrading to a full copy. Junctions
+                        // cannot point at remote/UNC paths (e.g. \\wsl.localhost),
+                        // which is where the copy fallback still applies.
+                        //
+                        // A junction is reported back as `SyncMode::Symlink`:
+                        // std treats mount points as symlinks (`is_symlink()`,
+                        // `read_link`), so freshness checks and removal handle
+                        // it exactly like a real directory symlink.
+                        match junction::create(source, target) {
+                            Ok(()) => {
+                                log::info!(
+                                    "symlink_dir {:?} -> {:?} failed ({err}); created directory junction instead",
+                                    target,
+                                    source
+                                );
+                                Ok(SyncMode::Symlink)
+                            }
+                            Err(junction_err) => {
+                                log::warn!(
+                                    "symlink_dir ({err}) and junction ({junction_err}) both failed for {:?} -> {:?}, falling back to copy",
+                                    target,
+                                    source
+                                );
+                                copy_dir_recursive(source, target)?;
+                                Ok(SyncMode::Copy)
+                            }
+                        }
                     }
                 }
             }
@@ -183,7 +205,12 @@ pub fn remove_target(target: &Path) -> Result<()> {
     if metadata.file_type().is_symlink() {
         #[cfg(windows)]
         {
-            if target.is_dir() {
+            use std::os::windows::fs::FileTypeExt;
+            // Decide from the link's own metadata: `target.is_dir()` follows
+            // the link, so a dangling directory symlink/junction would be
+            // misclassified as a file and `remove_file` would fail, leaving
+            // a broken link behind.
+            if metadata.file_type().is_symlink_dir() {
                 std::fs::remove_dir(target)?;
             } else {
                 std::fs::remove_file(target)?;
@@ -350,6 +377,46 @@ mod tests {
         let mode = sync_skill(&src, &tgt, SyncMode::Symlink).unwrap();
         assert!(matches!(mode, SyncMode::Symlink));
         assert!(tgt.is_symlink());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_target_is_recognized_and_removable() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source");
+        let tgt = tmp.path().join("target");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("SKILL.md"), "# hello").unwrap();
+        junction::create(&src, &tgt).unwrap();
+
+        // A junction must satisfy the symlink-mode freshness check so
+        // later syncs skip instead of re-creating it on every startup.
+        assert!(is_target_current(&src, &tgt, SyncMode::Symlink, None, None));
+        assert!(tgt.join("SKILL.md").exists());
+
+        // And sync_skill must treat it as already current.
+        let mode = sync_skill(&src, &tgt, SyncMode::Symlink).unwrap();
+        assert!(matches!(mode, SyncMode::Symlink));
+
+        remove_target(&tgt).unwrap();
+        assert!(fs::symlink_metadata(&tgt).is_err());
+        assert!(src.join("SKILL.md").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remove_target_removes_dangling_junction() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source");
+        let tgt = tmp.path().join("target");
+        fs::create_dir_all(&src).unwrap();
+        junction::create(&src, &tgt).unwrap();
+
+        // Delete the junction's target so the link dangles.
+        fs::remove_dir_all(&src).unwrap();
+
+        remove_target(&tgt).unwrap();
+        assert!(fs::symlink_metadata(&tgt).is_err());
     }
 
     #[test]

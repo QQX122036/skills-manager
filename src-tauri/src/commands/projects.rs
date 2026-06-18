@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use serde::Serialize;
@@ -945,13 +945,33 @@ pub async fn export_skill_to_project(
         ensure_safe_skill_relative_path(&dir_name)?;
 
         let source = PathBuf::from(&skill.central_path);
-        let agent_keys = agents.filter(|items| !items.is_empty()).unwrap_or_else(|| {
+        let requested_agent_keys = agents.filter(|items| !items.is_empty()).unwrap_or_else(|| {
             if project.workspace_type == "linked" {
                 vec![linked_workspace_agent_key(&project)]
             } else {
                 vec!["claude_code".to_string()]
             }
         });
+        let agent_keys = if project.workspace_type == "linked" {
+            requested_agent_keys
+        } else {
+            let available_targets: std::collections::HashSet<String> =
+                project_agent_targets_for_record(&store, &project)
+                    .into_iter()
+                    .filter(|target| target.installed && target.enabled)
+                    .map(|target| target.key)
+                    .collect();
+            let filtered = requested_agent_keys
+                .into_iter()
+                .filter(|key| available_targets.contains(key))
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                return Err(AppError::invalid_input(
+                    "No enabled installed agents selected for this project",
+                ));
+            }
+            filtered
+        };
 
         for agent_key in &agent_keys {
             let (skills_root, disabled_root) =

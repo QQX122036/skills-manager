@@ -43,6 +43,7 @@ import type {
   ToolInfo,
   GitBackupStatus,
   GitBackupVersion,
+  GitUpstreamHealth,
   SkillToolToggle,
 } from "../lib/tauri";
 import { getErrorMessage, getErrorKind } from "../lib/error";
@@ -165,6 +166,12 @@ export function MySkills() {
   const [restoringVersionTag, setRestoringVersionTag] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
   const [recoveryOpen, setRecoveryOpen] = useState(false);
+  // What the recovery dialog should explain. A merge conflict is not an
+  // upstream-health value, so it gets its own reason rather than being forced
+  // into `gitStatus.upstream_health` (which stays "healthy" during a conflict).
+  const [recoveryReason, setRecoveryReason] = useState<GitUpstreamHealth | "conflict">(
+    "unrelated_histories"
+  );
   const [tagEditSkillId, setTagEditSkillId] = useState<string | null>(null);
   const [tagInput, setTagInput] = useState("");
   const tagInputRef = useRef<HTMLInputElement>(null);
@@ -373,6 +380,16 @@ export function MySkills() {
     return fallback;
   };
 
+  // A merge conflict (or a leftover MERGE_HEAD from an older build, which the
+  // backend tags as SYNC_CONFLICT): the merge has been aborted, so the only
+  // safe in-app fix is to re-clone from remote. Deliberately does NOT match the
+  // generic "already in progress" message, which also covers non-conflict
+  // interruptions like a stale index.lock.
+  const isSyncConflictError = (error: unknown) => {
+    const message = getErrorMessage(error, "");
+    return message.includes("SYNC_CONFLICT") || message.includes("CONFLICT");
+  };
+
   // Detect errors that mean "the local repo's relationship to remote needs structural repair".
   const isRecoverableSetupError = (error: unknown) => {
     const message = getErrorMessage(error, "");
@@ -384,6 +401,7 @@ export function MySkills() {
       || message.includes("fetch first")
       || message.includes("failed to push some refs")
       || message.includes("no upstream")
+      || isSyncConflictError(error)
     );
   };
 
@@ -943,6 +961,7 @@ export function MySkills() {
         status.upstream_health === "unrelated_histories"
         || status.upstream_health === "detached"
       ) {
+        setRecoveryReason(status.upstream_health);
         setRecoveryOpen(true);
         return;
       }
@@ -960,7 +979,14 @@ export function MySkills() {
         toast.success(t("settings.gitPullSuccess"));
       }
 
-      if (committed || status.ahead > 0) {
+      // `no_upstream` means the local branch has commits but no remote-tracking
+      // branch yet (fresh init against an empty remote). `ahead` reads 0 in that
+      // state because there is no @{upstream} to diff against, so without this
+      // the first push is silently skipped and the remote stays empty while we
+      // report "Up to date". The backend push path sets upstream via `-u`.
+      const needsPush =
+        committed || status.ahead > 0 || status.upstream_health === "no_upstream";
+      if (needsPush) {
         const snapshotTag = await api.gitBackupCreateSnapshot();
         await api.gitBackupPush();
         toast.success(t("mySkills.gitSyncSuccessWithVersion", { tag: displaySnapshotLabel(snapshotTag) }));
@@ -978,6 +1004,9 @@ export function MySkills() {
       if (isRecoverableSetupError(e)) {
         toast.error(mapGitError(e));
         await refreshGitStatus();
+        setRecoveryReason(
+          isSyncConflictError(e) ? "conflict" : (gitStatus?.upstream_health ?? "unrelated_histories")
+        );
         setRecoveryOpen(true);
       } else {
         toast.error(mapGitError(e));
@@ -1237,7 +1266,10 @@ export function MySkills() {
                   </button>
                 ) : mode === "needs_fix" ? (
                   <button
-                    onClick={() => setRecoveryOpen(true)}
+                    onClick={() => {
+                      setRecoveryReason(gitStatus?.upstream_health ?? "unrelated_histories");
+                      setRecoveryOpen(true);
+                    }}
                     disabled={!!gitLoading}
                     className="inline-flex items-center gap-1 rounded-md px-3 py-2 text-[13px] font-medium text-red-500 transition-colors hover:bg-surface-hover disabled:opacity-50"
                   >
@@ -1912,7 +1944,7 @@ export function MySkills() {
       />
       <GitRecoveryDialog
         open={recoveryOpen}
-        health={gitStatus?.upstream_health ?? "unrelated_histories"}
+        reason={recoveryReason}
         onClose={() => setRecoveryOpen(false)}
         onReclone={handleRecoveryReclone}
       />

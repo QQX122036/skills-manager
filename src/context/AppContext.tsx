@@ -276,8 +276,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         },
       }
     );
-  // SKILL_UPDATE_TOAST_ID is a stable string constant defined in the component.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Check skill updates on startup (non-blocking, silent). When the user has
