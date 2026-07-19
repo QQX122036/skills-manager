@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { Globe } from "lucide-react";
 import { cn } from "../utils";
-import { getAgentIconSrc } from "../lib/agentIcons";
+import { getAgentIconSrc, agentIconNeedsDarkInvert } from "../lib/agentIcons";
 
 interface AgentIconProps {
   agentKey: string;
@@ -36,7 +36,11 @@ export function AgentIcon({
           src={src}
           alt=""
           draggable={false}
-          className={cn("h-full w-full object-contain", imageClassName)}
+          className={cn(
+            "h-full w-full object-contain",
+            agentIconNeedsDarkInvert(agentKey) && "dark:invert",
+            imageClassName
+          )}
           onError={() => setFailedSrc(src)}
         />
       ) : (

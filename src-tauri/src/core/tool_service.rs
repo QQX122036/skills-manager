@@ -32,12 +32,12 @@ pub fn get_disabled_tools(store: &SkillStore) -> Vec<String> {
 
 const DEFAULT_PRIORITY_ORDER: &[&str] = &[
     "claude_code",
-    "omp_agent",
     "codex",
     "grok",
     "gemini_cli",
     "cursor",
     "opencode",
+    "omp_agent",
     "hermes",
     "openclaw",
 ];
@@ -401,9 +401,11 @@ mod tests {
         let order = merge_order(&[], &all);
         // Priority list comes first, then remaining adapters in their natural order.
         assert_eq!(order[0], "claude_code");
-        assert_eq!(order[1], "omp_agent");
-        assert_eq!(order[2], "codex");
-        assert_eq!(order[3], "grok");
+        assert_eq!(order[1], "codex");
+        assert_eq!(order[2], "grok");
+        // omp_agent sits after the mainstream coding agents, not near the top.
+        let opencode = order.iter().position(|k| k == "opencode").unwrap();
+        assert_eq!(order[opencode + 1], "omp_agent");
     }
 
     #[test]
@@ -422,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn new_omp_agent_slots_after_claude_code_for_existing_users() {
+    fn new_omp_agent_slots_after_mainstream_agents_for_existing_users() {
         let saved = v(&["claude_code", "codex", "grok", "gemini_cli", "cursor", "opencode"]);
         let all = v(&[
             "cursor",
@@ -434,11 +436,16 @@ mod tests {
             "opencode",
         ]);
         let order = merge_order(&saved, &all);
-        let claude_code = order.iter().position(|k| k == "claude_code").unwrap();
+        let opencode = order.iter().position(|k| k == "opencode").unwrap();
         let omp_agent = order.iter().position(|k| k == "omp_agent").unwrap();
-        let codex = order.iter().position(|k| k == "codex").unwrap();
-        assert_eq!(order[claude_code + 1], "omp_agent");
-        assert!(codex > omp_agent, "codex must remain after omp_agent");
+        let claude_code = order.iter().position(|k| k == "claude_code").unwrap();
+        // omp_agent slots right after opencode (its predecessor in the priority
+        // list), i.e. below the mainstream coding agents — not right after claude_code.
+        assert_eq!(order[opencode + 1], "omp_agent");
+        assert!(
+            omp_agent > claude_code + 1,
+            "omp_agent must not sit right after claude_code"
+        );
     }
 
     #[test]

@@ -48,9 +48,21 @@ const AGENT_ICON_FILES: Record<string, string> = {
   zencoder: "zencoder.png",
 };
 
+// Monochrome line-art icons that render black (no fill / `currentColor`) and
+// therefore vanish on dark backgrounds. They carry no light variant, so we
+// invert them under the app's dark theme (#279 Codex, #304 ChatGPT which maps
+// to the same OpenAI mark). Icons that already self-adapt via an internal
+// `prefers-color-scheme` rule (e.g. augment.svg) must NOT be listed here, or
+// they would double-invert.
+const DARK_INVERT_ICON_KEYS = new Set<string>(["codex", "roo_code"]);
+
 export function getAgentIconSrc(agentKey: string): string | null {
   const file = AGENT_ICON_FILES[agentKey];
   return file ? `/agent-icons/${file}` : null;
+}
+
+export function agentIconNeedsDarkInvert(agentKey: string): boolean {
+  return DARK_INVERT_ICON_KEYS.has(agentKey);
 }
 
 export function hasAgentIcon(agentKey: string): boolean {

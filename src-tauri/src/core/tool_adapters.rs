@@ -171,6 +171,11 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
             project_relative_skills_dir: None,
         },
         ToolAdapter {
+            // oh-my-pi (omp) reads native skills from asymmetric paths: the
+            // user-level scan is `~/.omp/agent/skills` (the active profile's
+            // agent dir), while the project-level scan walks up for
+            // `<repo>/.omp/skills` (no `agent` segment). See the `native`
+            // provider in oh-my-pi `discovery/builtin.ts`.
             key: "omp_agent".into(),
             display_name: "OMP Agent".into(),
             relative_skills_dir: ".omp/agent/skills".into(),
@@ -180,9 +185,8 @@ pub fn default_tool_adapters() -> Vec<ToolAdapter> {
             category: ToolCategory::Coding,
             is_custom: false,
             recursive_scan: false,
-            project_relative_skills_dir: None,
+            project_relative_skills_dir: Some(".omp/skills".into()),
         },
-
         ToolAdapter {
             // Codex CLI reads user-level skills from `~/.codex/skills/` and
             // project-level skills from `<repo>/.codex/skills/`. The shared
@@ -949,8 +953,11 @@ mod tests {
         assert_eq!(adapter.category, ToolCategory::Coding);
         assert!(!adapter.is_custom);
         assert!(!adapter.recursive_scan);
-        assert!(adapter.project_relative_skills_dir.is_none());
-        assert_eq!(adapter.project_relative_skills_dir(), ".omp/agent/skills");
+        assert_eq!(
+            adapter.project_relative_skills_dir.as_deref(),
+            Some(".omp/skills")
+        );
+        assert_eq!(adapter.project_relative_skills_dir(), ".omp/skills");
     }
 
     #[test]
@@ -992,7 +999,7 @@ mod tests {
         assert_eq!(adapter.category, ToolCategory::Coding);
         assert_eq!(adapter.relative_skills_dir, ".omp/agent/skills");
         assert_eq!(adapter.relative_detect_dir, ".omp/agent");
-        assert_eq!(adapter.project_relative_skills_dir(), ".omp/agent/skills");
+        assert_eq!(adapter.project_relative_skills_dir(), ".omp/skills");
 
         let custom_adapter = adapters
             .iter()
@@ -1010,7 +1017,7 @@ mod tests {
         assert_eq!(found.category, ToolCategory::Coding);
         assert_eq!(found.relative_skills_dir, ".omp/agent/skills");
         assert_eq!(found.relative_detect_dir, ".omp/agent");
-        assert_eq!(found.project_relative_skills_dir(), ".omp/agent/skills");
+        assert_eq!(found.project_relative_skills_dir(), ".omp/skills");
     }
 
     #[test]

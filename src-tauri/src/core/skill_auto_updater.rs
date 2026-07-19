@@ -25,6 +25,13 @@ const INITIAL_DELAY: Duration = Duration::from_secs(60);
 /// a changed interval setting takes effect.
 const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// Brief pause between per-skill checks. Each check holds the central-repo lock
+/// for a network round-trip; without a gap, this loop re-acquires the lock so
+/// quickly that a waiting user-initiated operation can be starved for the whole
+/// round. The pause must exceed the foreground poll cadence in `repo_lock`
+/// (50ms) so a foreground waiter reliably wins the lock during the gap.
+const FOREGROUND_YIELD: Duration = Duration::from_millis(200);
+
 #[derive(Serialize, Clone)]
 struct AutoUpdatePayload {
     ran_at: String,
@@ -152,6 +159,9 @@ fn run_round_blocking(store: &SkillStore) -> Result<(), String> {
     let (mut checked, mut available, mut updated, mut failed) =
         (0usize, 0usize, 0usize, 0usize);
     for skill_id in ids {
+        // Yield the lock to any waiting user-initiated operation before taking
+        // it again for the next skill (see FOREGROUND_YIELD).
+        std::thread::sleep(FOREGROUND_YIELD);
         checked += 1;
 
         // The check holds the repo lock; it must be released before applying,
